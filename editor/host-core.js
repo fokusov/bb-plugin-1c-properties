@@ -1,7 +1,7 @@
 // Host half: file tree and Git operations for the BB thread workspace,
 // plus metadata parsing and static go-to-definition.
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, promises as fs, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, promises as fs, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join, relative, normalize, isAbsolute, sep } from "node:path";
@@ -755,7 +755,15 @@ function loadReviewed() {
 function reviewRootKey(store, root) {
   if (Object.hasOwn(store, root) || process.platform !== "win32") return root;
   const canonical = gitRootKey(root);
-  return Object.keys(store).find((key) => gitRootKey(key) === canonical) ?? root;
+  const keys = Object.keys(store);
+  const normalized = keys.find((key) => gitRootKey(key) === canonical);
+  if (normalized) return normalized;
+  const physical = (path) => {
+    try { return gitRootKey(realpathSync.native(path)); }
+    catch { return undefined; }
+  };
+  const physicalRoot = physical(root);
+  return (physicalRoot && keys.find((key) => physical(key) === physicalRoot)) || root;
 }
 
 function reviewedEntry(root, path) {

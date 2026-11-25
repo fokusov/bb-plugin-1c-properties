@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -85,7 +85,9 @@ test("editor routes, Git changes and search stay inside each thread's current wo
   assert.match(JSON.stringify(diffs[0].body), /\+\/\/ left/);
   assert.match(JSON.stringify(diffs[1].body), /\+\/\/ right/);
   await mkdir(dataDir);
-  const formerRoot = left.replaceAll("\\", "/");
+  const formerPath = process.platform === "win32" ? join(temp, "legacy-left") : left;
+  if (formerPath !== left) await symlink(left, formerPath, "junction");
+  const formerRoot = formerPath.replaceAll("\\", "/");
   const formerHead = git(left, "rev-parse", "HEAD").trim();
   await writeFile(join(dataDir, "reviewed.json"), JSON.stringify({
     [formerRoot]: { "Module.bsl": { headSha: formerHead, marks: [{ id: "migrated" }], hashes: ["migrated"] } },

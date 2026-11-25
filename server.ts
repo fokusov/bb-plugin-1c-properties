@@ -473,7 +473,10 @@ export default async function plugin(bb: BbPluginApi) {
         } else if (basename(executable).toLowerCase() === "bb.cmd") {
           executable = join(dirname(executable), "bb");
         }
-        prefix = [executable];
+        // BB 0.50.1 can exit before its Windows IPC handles have closed.
+        // Drain the Node CLI process while preserving its original exit code.
+        const drain = "const exit = process.exit.bind(process); process.exit = code => setTimeout(() => exit(code), 100);";
+        prefix = ["--import", `data:text/javascript,${encodeURIComponent(drain)}`, executable];
         executable = "node.exe";
       }
       const { stdout } = await runCli(executable, [
