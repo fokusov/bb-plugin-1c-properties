@@ -466,7 +466,12 @@ export default async function plugin(bb: BbPluginApi) {
       const options = { signal, windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 };
       let executable = process.env.BB_CLI || "bb";
       let prefix: string[] = [];
-      const env: NodeJS.ProcessEnv = { ...process.env, BB_PROJECT_ID: scope.projectId, BB_THREAD_ID: scope.threadId ?? "" };
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        BB_SERVER_URL: bb.server.loopbackBaseUrl,
+        BB_PROJECT_ID: scope.projectId,
+        BB_THREAD_ID: scope.threadId ?? "",
+      };
       if (process.platform === "win32" && !/\.exe$/i.test(executable)) {
         if (executable === "bb") {
           const { stdout } = await runCli("where.exe", ["bb.cmd"], options);
