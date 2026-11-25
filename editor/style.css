@@ -1,0 +1,25 @@
+.bsl-editor-root {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  color: var(--foreground);
+  --dsw-alias-bg-base: var(--background);
+  --dsw-alias-bg-layer-1: var(--background);
+  --dsw-alias-bg-layer-2: var(--card);
+  --dsw-alias-border-l2: var(--border);
+  --dsw-alias-hairline: var(--border);
+  --dsw-alias-label-primary: var(--foreground);
+  --dsw-alias-label-secondary: var(--muted-foreground);
+  --dsw-alias-interactive-bg-hover: var(--accent);
+  --dsw-alias-state-business-primary: var(--primary);
+  --dsw-font-s-14: 13px/20px var(--font-sans, sans-serif);
+  --dsw-font-family: var(--font-sans, sans-serif);
+  --dsh-composer-height: 0px;
+}
+
+.bsl-editor-root button:focus-visible,
+.bsl-editor-root input:focus-visible,
+.bsl-editor-root textarea:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}

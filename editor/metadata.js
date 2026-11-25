@@ -1,0 +1,1258 @@
+// lib/metadata.js — 1C configuration metadata tree, 3 dump formats.
+//
+//   • edt      — EDT project: <root>/Configuration/Configuration.mdo, objects in
+//                src-style dirs (Catalogs/<Name>/<Name>.mdo, ...).
+//   • xml      — Designer "dump to files" WITH ConfigDumpInfo.xml (flat or
+//                hierarchical list of all metadata objects).
+//   • object   — object-by-object XML dump WITHOUT ConfigDumpInfo.xml
+//                (root Configuration.xml + type dirs; object defs <Type>/<N>.xml;
+//                child structure recovered from the filesystem).
+//
+// A dump may also carry an ExternalFiles folder at its root: <Name>.xml is the
+// object definition (ExternalDataProcessor | ExternalReport) and <Name>/ holds
+// Forms, Templates and Ext/ObjectModule.bsl. Such objects are not configuration
+// metadata, so the tree shows them as its own root item «Внешние отчеты/обработки».
+//
+// The model is lazy: top level lists groups, groups list objects, objects list
+// sections, sections list items. Only what the user expands gets parsed, so a
+// Large-scale config stays instant. Parsed artifacts (Configuration.mdo,
+// ConfigDumpInfo.xml, per-object .xml) are cached.
+//
+// Node keys are config-root-relative posix paths: "Catalogs", "Catalogs/Товары",
+// "Catalogs/Товары/Формы" (virtual sections use Russian labels as the last
+// segment). Leaf items carry an absolute `file` path for the editor.
+
+import { promises as fs, existsSync } from "node:fs";
+import { join, posix } from "node:path";
+import { XMLParser } from "fast-xml-parser";
+
+// ---------------------------------------------------------------------------
+// Constants: display order, labels, icons (mirrors vscode-1c-metadata-viewer)
+// ---------------------------------------------------------------------------
+
+const COMMON_GROUPS = [
+  ["Subsystems", "Подсистемы", "subsystem"],
+  ["CommonModules", "Общие модули", "commonModule"],
+  ["SessionParameters", "Параметры сеанса", "sessionParameter"],
+  ["Roles", "Роли", "role"],
+  ["CommonAttributes", "Общие реквизиты", "attribute"],
+  ["ExchangePlans", "Планы обмена", "exchangePlan"],
+  ["FilterCriteria", "Критерии отбора", "filterCriteria"],
+  ["EventSubscriptions", "Подписки на события", "eventSubscription"],
+  ["ScheduledJobs", "Регламентные задания", "scheduledJob"],
+  ["FunctionalOptions", "Функциональные опции", "common"],
+  ["FunctionalOptionsParameters", "Параметры функциональных опций", "common"],
+  ["DefinedTypes", "Определяемые типы", "common"],
+  ["SettingsStorages", "Хранилища настроек", "common"],
+  ["CommonCommands", "Общие команды", "command"],
+  ["CommandGroups", "Группы команд", "common"],
+  ["CommonForms", "Общие формы", "form"],
+  ["CommonTemplates", "Общие макеты", "template"],
+  ["CommonPictures", "Общие картинки", "picture"],
+  ["WebServices", "Web-сервисы", "ws"],
+  ["HTTPServices", "HTTP-сервисы", "http"],
+  ["WSReferences", "WS-ссылки", "wsLink"],
+  ["Styles", "Стили", "style"],
+];
+
+const MAIN_GROUPS = [
+  ["Constants", "Константы", "constant"],
+  ["Catalogs", "Справочники", "catalog"],
+  ["Documents", "Документы", "document"],
+  ["DocumentNumerators", "Нумераторы", "documentNumerator"],
+  ["Sequences", "Последовательности", "sequence"],
+  ["DocumentJournals", "Журналы документов", "documentJournal"],
+  ["Enums", "Перечисления", "enum"],
+  ["Reports", "Отчеты", "report"],
+  ["DataProcessors", "Обработки", "dataProcessor"],
+  ["ChartsOfCharacteristicTypes", "Планы видов характеристик", "chartsOfCharacteristicType"],
+  ["ChartsOfAccounts", "Планы счетов", "chartsOfAccount"],
+  ["ChartsOfCalculationTypes", "Планы видов расчета", "chartsOfCalculationType"],
+  ["InformationRegisters", "Регистры сведений", "informationRegister"],
+  ["AccumulationRegisters", "Регистры накопления", "accumulationRegister"],
+  ["AccountingRegisters", "Регистры бухгалтерии", "accountingRegister"],
+  ["CalculationRegisters", "Регистры расчета", "calculationRegister"],
+  ["BusinessProcesses", "Бизнес-процессы", "businessProcess"],
+  ["Tasks", "Задачи", "task"],
+  ["ExternalDataSources", "Внешние источники данных", "externalDataSource"],
+];
+
+// Внешние отчеты/обработки: папка ExternalFiles в корне выгрузки. Объект — это
+// <Имя>.xml (описание) и/или папка <Имя>/ (Forms, Templates, Ext/ObjectModule.bsl);
+// в дереве это отдельный корневой пункт, а не группа метаданных.
+const EXT_DIR = "ExternalFiles";
+const EXT_LABEL = "Внешние отчеты/обработки";
+const EXT_ICON = "folder";
+
+const DIRS = new Set([...COMMON_GROUPS, ...MAIN_GROUPS].map(([d]) => d));
+
+const GROUP_LABEL = new Map([...COMMON_GROUPS, ...MAIN_GROUPS].map(([dir, label]) => [dir, label]));
+function groupLabel(dir) {
+  return dir === EXT_DIR ? EXT_LABEL : GROUP_LABEL.get(dir) || dir;
+}
+
+// EDT Configuration.mdo property names per type dir (try both spellings —
+// EDT's schema has a known "accomulationRegisters" typo).
+const MDO_PROP = Object.fromEntries([
+  ...COMMON_GROUPS.map(([d]) => [d, camel(d)]),
+  ...MAIN_GROUPS.map(([d]) => [d, camel(d)]),
+]);
+MDO_PROP.AccumulationRegisters = ["accumulationRegisters", "accomulationRegisters"];
+
+function camel(dir) {
+  const s = dir.replace(/s$/, "");
+  return [s.charAt(0).toLowerCase() + s.slice(1) + "s"];
+}
+
+// ConfigDumpInfo metadata name prefix per type dir.
+const XML_PREFIX = {
+  Subsystems: "Subsystem.", CommonModules: "CommonModule.", SessionParameters: "SessionParameter.",
+  Roles: "Role.", CommonAttributes: "CommonAttribute.", ExchangePlans: "ExchangePlan.",
+  FilterCriteria: "FilterCriterion.", EventSubscriptions: "EventSubscription.",
+  ScheduledJobs: "ScheduledJob.", FunctionalOptions: "FunctionalOption.",
+  FunctionalOptionsParameters: "FunctionalOptionsParameter.", DefinedTypes: "DefinedType.",
+  SettingsStorages: "SettingsStorage.", CommonCommands: "CommonCommand.",
+  CommandGroups: "CommandGroup.", CommonForms: "CommonForm.", CommonTemplates: "CommonTemplate.",
+  CommonPictures: "CommonPicture.", WebServices: "WebService.", HTTPServices: "HTTPService.",
+  WSReferences: "WSReference.", Styles: "Style.", Constants: "Constant.",
+  Catalogs: "Catalog.", Documents: "Document.", DocumentNumerators: "DocumentNumerator.",
+  Sequences: "Sequence.", DocumentJournals: "DocumentJournal.", Enums: "Enum.",
+  Reports: "Report.", DataProcessors: "DataProcessor.",
+  ChartsOfCharacteristicTypes: "ChartOfCharacteristicTypes.", ChartsOfAccounts: "ChartOfAccounts.",
+  ChartsOfCalculationTypes: "ChartOfCalculationTypes.", InformationRegisters: "InformationRegister.",
+  AccumulationRegisters: "AccumulationRegister.", AccountingRegisters: "AccountingRegister.",
+  CalculationRegisters: "CalculationRegister.", BusinessProcesses: "BusinessProcess.",
+  Tasks: "Task.", ExternalDataSources: "ExternalDataSource.",
+};
+
+// 1C metadata name → dump folder path (same table as the reference's CreatePath).
+function createPath(name) {
+  return name
+    .replace(/Subsystem\./g, "Subsystems/")
+    .replace(/CommonModule\./g, "CommonModules/")
+    .replace(/SessionParameter\./g, "SessionParameters/")
+    .replace(/Role\./g, "Roles/")
+    .replace(/CommonAttribute\./g, "CommonAttributes/")
+    .replace(/ExchangePlan\./g, "ExchangePlans/")
+    .replace(/FilterCriterion\./g, "FilterCriteria/")
+    .replace(/EventSubscription\./g, "EventSubscriptions/")
+    .replace(/ScheduledJob\./g, "ScheduledJobs/")
+    .replace(/FunctionalOption\./g, "FunctionalOptions/")
+    .replace(/FunctionalOptionsParameter\./g, "FunctionalOptionsParameters/")
+    .replace(/DefinedType\./g, "DefinedTypes/")
+    .replace(/SettingsStorage\./g, "SettingsStorages/")
+    .replace(/CommonCommand\./g, "CommonCommands/")
+    .replace(/CommandGroup\./g, "CommandGroups/")
+    .replace(/CommonForm\./g, "CommonForms/")
+    .replace(/CommonTemplate\./g, "CommonTemplates/")
+    .replace(/CommonPicture\./g, "CommonPictures/")
+    .replace(/WebService\./g, "WebServices/")
+    .replace(/HTTPService\./g, "HTTPServices/")
+    .replace(/WSReference\./g, "WSReferences/")
+    .replace(/StyleItem\./g, "StyleItems/")
+    .replace(/Style\./g, "Styles/")
+    .replace(/Constant\./g, "Constants/")
+    .replace(/Catalog\./g, "Catalogs/")
+    .replace(/Document\./g, "Documents/")
+    .replace(/DocumentNumerator\./g, "DocumentNumerators/")
+    .replace(/Sequence\./g, "Sequences/")
+    .replace(/DocumentJournal\./g, "DocumentJournals/")
+    .replace(/Enum\./g, "Enums/")
+    .replace(/Report\./g, "Reports/")
+    .replace(/DataProcessor\./g, "DataProcessors/")
+    .replace(/ChartOfCharacteristicTypes\./g, "ChartsOfCharacteristicTypes/")
+    .replace(/ChartOfAccounts\./g, "ChartsOfAccounts/")
+    .replace(/ChartOfCalculationTypes\./g, "ChartsOfCalculationTypes/")
+    .replace(/InformationRegister\./g, "InformationRegisters/")
+    .replace(/AccumulationRegister\./g, "AccumulationRegisters/")
+    .replace(/AccountingRegister\./g, "AccountingRegisters/")
+    .replace(/CalculationRegister\./g, "CalculationRegisters/")
+    .replace(/BusinessProcess\./g, "BusinessProcesses/")
+    .replace(/Task\./g, "Tasks/")
+    .replace(/ExternalDataSource\./g, "ExternalDataSources/")
+    .replace(/\.Template\./g, "/Templates/");
+}
+
+// ---------------------------------------------------------------------------
+// XML parsing helpers
+// ---------------------------------------------------------------------------
+
+export function parseMetadataXml(xml) {
+  return new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "$_",
+    trimValues: false,
+    // Repeated <Metadata> inside ConfigDumpInfo (both flat and hierarchical).
+    isArray: (name, jpath) => jpath.endsWith(".Metadata"),
+  }).parse(xml);
+}
+
+function makeParser() {
+  return { parse: parseMetadataXml };
+}
+
+// Strip namespace prefix: "v8:item" → "item", "mdclass:Catalog" → "Catalog".
+function tag(name) {
+  const i = String(name).indexOf(":");
+  return i === -1 ? name : name.slice(i + 1);
+}
+
+function asArray(x) {
+  if (x == null) return [];
+  return Array.isArray(x) ? x : [x];
+}
+
+// Extract list items from an EDT-style container: either a direct array of
+// items, or a plural wrapper holding singular <itemTag> children.
+function mdoItems(node, itemTag) {
+  if (node == null) return [];
+  const out = [];
+  for (const x of asArray(node)) {
+    if (x && typeof x === "object") {
+      const kids = x[itemTag] ?? x[itemTag + "s"];
+      if (kids != null) out.push(...asArray(kids));
+      else out.push(x);
+    } else {
+      out.push(x);
+    }
+  }
+  return out;
+}
+
+// Synonym from the 1C localized-content shapes used across formats.
+//   {v8:item:{v8:lang,v8:content}}  (XML dump)
+//   {item:[{lang,value}]}           (EDT .mdo)
+//   {value:"..."}                   (EDT Configuration.mdo)
+function getSynonym(node) {
+  if (!node) return "";
+  const syn = node.Synonym ?? node.synonym;
+  if (!syn) return "";
+  const items = asArray(syn["v8:item"] ?? syn.item ?? syn["v8:Item"]);
+  for (const it of items) {
+    const v = it["v8:content"] ?? it.content ?? it["v8:value"] ?? it.value;
+    if (v != null && String(v).trim()) return String(v);
+  }
+  if (syn["v8:value"] ?? syn.value) return String(syn["v8:value"] ?? syn.value);
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// Format detection
+// ---------------------------------------------------------------------------
+
+async function dirsAt(root) {
+  try {
+    const names = await fs.readdir(root, { withFileTypes: true });
+    return new Set(names.filter((d) => d.isDirectory()).map((d) => d.name));
+  } catch {
+    return new Set();
+  }
+}
+
+async function fileExists(root, rel) {
+  try {
+    await fs.access(join(root, ...rel.split("/")));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Find the 1C configuration inside `root` (scan depth ≤ 3, shallowest wins).
+// Returns { format: "edt" | "xml" | "object", configRoot } or null.
+export async function detectConfig(root) {
+  const queue = [{ dir: root, depth: 0 }];
+  const seen = new Set();
+  let best = null; // { format, dir, depth }
+
+  while (queue.length) {
+    const { dir, depth } = queue.shift();
+    if (depth > 3 || seen.has(dir)) continue;
+    seen.add(dir);
+
+    const rel = dir === root ? "" : dir.slice(root.length + 1);
+    const mdoOk =
+      (await fileExists(dir, "Configuration/Configuration.mdo")) ||
+      (rel && (await fileExists(dir, "Configuration.mdo")));
+    if (mdoOk && (!best || best.depth > depth)) {
+      best = { format: "edt", dir, depth };
+      continue; // an EDT project is self-contained; don't descend further
+    }
+    const cdiOk = await fileExists(dir, "ConfigDumpInfo.xml");
+    const cfgXmlOk = await fileExists(dir, "Configuration.xml");
+    if (cdiOk && (!best || best.depth > depth)) {
+      best = { format: "xml", dir, depth };
+    } else if (cfgXmlOk && !cdiOk) {
+      const subs = await dirsAt(dir);
+      if ([...DIRS].some((d) => subs.has(d)) && (!best || best.depth > depth)) {
+        best = { format: "object", dir, depth };
+      }
+    }
+    if (depth < 3) {
+      const subs = await dirsAt(dir);
+      for (const s of subs) {
+        if (s === ".git" || s === "node_modules" || s.startsWith(".")) continue;
+        queue.push({ dir: join(dir, s), depth: depth + 1 });
+      }
+    }
+  }
+  return best;
+}
+
+// Passport callers need to report ambiguity instead of silently choosing the
+// shallowest project. Keep the same depth and directory exclusions as detectConfig.
+export async function detectConfigRoots(root, maxDirectories = 1000) {
+  const queue = [{ dir: root, depth: 0 }];
+  const seen = new Set();
+  const found = [];
+  let complete = true;
+  while (queue.length) {
+    const { dir, depth } = queue.shift();
+    if (depth > 3 || seen.has(dir)) continue;
+    if (seen.size >= maxDirectories) { complete = false; break; }
+    seen.add(dir);
+    const rel = dir === root ? "" : dir.slice(root.length + 1);
+    const mdoOk = (await fileExists(dir, "Configuration/Configuration.mdo")) || (rel && (await fileExists(dir, "Configuration.mdo")));
+    if (mdoOk) {
+      found.push({ format: "edt", dir, depth });
+      continue;
+    }
+    const cdiOk = await fileExists(dir, "ConfigDumpInfo.xml");
+    const cfgXmlOk = await fileExists(dir, "Configuration.xml");
+    if (cdiOk) found.push({ format: "xml", dir, depth });
+    else if (cfgXmlOk) {
+      const subs = await dirsAt(dir);
+      if ([...DIRS].some((d) => subs.has(d))) found.push({ format: "object", dir, depth });
+    }
+    if (depth < 3) {
+      for (const sub of await dirsAt(dir)) {
+        if (sub === ".git" || sub === "node_modules" || sub.startsWith(".")) continue;
+        queue.push({ dir: join(dir, sub), depth: depth + 1 });
+      }
+    }
+  }
+  return { roots: found, complete };
+}
+
+// ---------------------------------------------------------------------------
+// The lazy model
+// ---------------------------------------------------------------------------
+
+export class MetaModel {
+  constructor(root) {
+    this.root = root;
+    this.format = null;
+    this.configRoot = null;
+    this.ready = null;
+    // caches
+    this.mdo = null; // parsed Configuration.mdo (edt)
+    this.flat = null; // flattened ConfigDumpInfo entries (xml)
+    this.objCache = new Map(); // object def (edt .mdo / object .xml) by key
+    this.groupsCache = null; // [ {key,label,icon,count,hasCommon} ]
+    this.extKinds = null; // Map<имя внешнего объекта, "report" | "dataProcessor">
+    this.changedSet = null; // Set<relPath> — активен только при changed=1
+    this.changedCountsCache = new Map(); // dir -> отфильтрованный список объектов
+  }
+
+  async init() {
+    if (this.ready) return this.ready;
+    this.ready = (async () => {
+      const det = await detectConfig(this.root);
+      if (!det) {
+        throw new Error("Конфигурация 1С не найдена (искал Configuration.mdo, ConfigDumpInfo.xml, Configuration.xml)");
+      }
+      this.format = det.format;
+      this.configRoot = det.dir;
+      await this.buildGroups();
+    })();
+    return this.ready;
+  }
+
+  // --- group listing ------------------------------------------------------
+
+  async buildGroups() {
+    if (this.format === "edt") await this.ensureMdo();
+    const common = [];
+    for (const [dir, label, icon] of COMMON_GROUPS) {
+      const n = await this.groupCount(dir);
+      if (n > 0) common.push({ key: dir, label, icon, count: n });
+    }
+    // Root-level modules of the configuration itself (XML dumps keep them in Ext/).
+    const ext = join(this.configRoot, "Ext");
+    const rootModules = this.format !== "edt"
+      ? ["ManagedApplicationModule.bsl", "SessionModule.bsl", "ExternalConnectionModule.bsl"]
+          .filter((f) => existsSync(join(ext, f)))
+          .map((f) => ({
+            key: null,
+            label: MODULE_LABELS[f] ?? f.replace(/Module\.bsl$/, ""),
+            icon: "commonModule",
+            file: join(ext, f),
+          }))
+      : [];
+    const main = [];
+    for (const [dir, label, icon] of MAIN_GROUPS) {
+      const n = await this.groupCount(dir);
+      if (n > 0) main.push({ key: dir, label, icon, count: n });
+    }
+    const items = [];
+    if (rootModules.length) items.push(...rootModules);
+    if (common.length) items.push({ key: "Общие", label: "Общие", icon: "common", count: common.length, children: common });
+    const extItems = await this.externalObjects();
+    if (extItems.length) items.push({ key: EXT_DIR, label: EXT_LABEL, icon: EXT_ICON, count: extItems.length });
+    items.push(...main);
+    this.groupsCache = items;
+  }
+
+  // Number of objects in a type group, per format.
+  async groupCount(dir) {
+    if (this.format === "edt") return this.mdoObjects(dir).length;
+    if (this.format === "xml") {
+      await this.ensureFlat();
+      const p = XML_PREFIX[dir];
+      return p ? this.flat.filter((e) => e.name.startsWith(p) && e.parts.length === 2).length : 0;
+    }
+    // object: count folders + standalone definition files
+    const abs = join(this.configRoot, dir);
+    let names;
+    try {
+      names = await fs.readdir(abs, { withFileTypes: true });
+    } catch {
+      return 0;
+    }
+    const defs = new Set(names.filter((d) => d.isFile() && d.name.endsWith(".xml")).map((d) => d.name.slice(0, -4)));
+    const dirs = names.filter((d) => d.isDirectory()).map((d) => d.name);
+    return new Set([...dirs, ...defs]).size;
+  }
+
+  // --- object listing ------------------------------------------------------
+
+  async listObjects(dir) {
+    if (dir === EXT_DIR) return this.externalObjects();
+    let out;
+    if (this.format === "edt") {
+      const names = this.mdoObjects(dir);
+      out = names.map((name) => ({
+        key: dir + "/" + name,
+        label: name,
+        icon: this.groupIcon(dir),
+        count: 1,
+      }));
+    } else if (this.format === "xml") {
+      await this.ensureFlat();
+      const p = XML_PREFIX[dir];
+      const seen = new Set();
+      out = [];
+      for (const e of this.flat) {
+        if (!e.name.startsWith(p) || e.parts.length !== 2) continue;
+        const objName = e.parts[1];
+        if (seen.has(objName)) continue;
+        seen.add(objName);
+        out.push({ key: dir + "/" + objName, label: objName, icon: this.groupIcon(dir), count: 1 });
+      }
+    } else {
+      // object format: folders + standalone defs, deduped
+      const abs = join(this.configRoot, dir);
+      let names;
+      try {
+        names = await fs.readdir(abs, { withFileTypes: true });
+      } catch {
+        return [];
+      }
+      const seen = new Set();
+      out = [];
+      for (const d of names) {
+        const objName = d.isDirectory() ? d.name : d.isFile() && d.name.endsWith(".xml") ? d.name.slice(0, -4) : null;
+        if (!objName || seen.has(objName)) continue;
+        seen.add(objName);
+        out.push({ key: dir + "/" + objName, label: objName, icon: this.groupIcon(dir), count: 1 });
+      }
+      out.sort((a, b) => a.label.localeCompare(b.label, "ru"));
+    }
+    // Module-only types (общий модуль, подписка на событие, регламентное
+    // задание, ...) open straight from their file — no extra nesting level.
+    const dm = DIRECT_MODULES[dir];
+    if (dm) {
+      for (const item of out) {
+        const p = join(this.configRoot, dir, item.label, ...dm);
+        if (existsSync(p)) {
+          item.key = null;
+          item.file = p;
+          item.count = undefined;
+        }
+      }
+    }
+    return out;
+  }
+
+  // --- внешние отчеты/обработки (ExternalFiles) ----------------------------
+
+  // Объекты раздела = объединение папок <Имя>/ и описаний <Имя>.xml: в выгрузке
+  // встречаются оба варианта (описание без папки и папка без описания).
+  async externalObjects() {
+    const abs = join(this.configRoot, EXT_DIR);
+    let names;
+    try {
+      names = await fs.readdir(abs, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    await this.ensureExtKinds();
+    const byName = new Map(); // имя → есть ли <Имя>.xml
+    for (const d of names) {
+      if (d.isDirectory()) byName.set(d.name, byName.get(d.name) ?? false);
+      else if (d.isFile() && d.name.toLowerCase().endsWith(".xml")) byName.set(d.name.slice(0, -4), true);
+    }
+    const out = [];
+    for (const [name, hasXml] of byName) {
+      out.push({
+        key: EXT_DIR + "/" + name,
+        label: name,
+        icon: this.extIcon(name),
+        count: 1,
+        // Правый клик по объекту — «Открыть XML»; левый раскрывает его (file у
+        // узла внешнего объекта не задан намеренно, иначе клик открывал бы файл).
+        ...(hasXml ? { xmlFile: join(abs, name + ".xml") } : {}),
+      });
+    }
+    out.sort((a, b) => a.label.localeCompare(b.label, "ru"));
+    return out;
+  }
+
+  // Отчет или обработка — по корневому элементу описания. Читается один раз при
+  // построении дерева: иконка нужна и в списке объектов, и в «Изменённых».
+  async ensureExtKinds() {
+    if (this.extKinds) return this.extKinds;
+    const kinds = new Map();
+    const abs = join(this.configRoot, EXT_DIR);
+    try {
+      const names = await fs.readdir(abs);
+      await Promise.all(
+        names
+          .filter((n) => n.toLowerCase().endsWith(".xml"))
+          .map(async (n) => {
+            try {
+              const xml = await fs.readFile(join(abs, n), "utf-8");
+              const m = /<MetaDataObject[^>]*>\s*<([A-Za-z0-9_:]+)/.exec(xml);
+              const cls = m ? m[1].split(":").pop() : "";
+              kinds.set(n.slice(0, -4), cls === "ExternalReport" ? "report" : "dataProcessor");
+            } catch {}
+          }),
+      );
+    } catch {}
+    this.extKinds = kinds;
+    return kinds;
+  }
+
+  extIcon(name) {
+    return this.extKinds?.get(name) ?? "dataProcessor";
+  }
+
+  // --- object sections -----------------------------------------------------
+
+  async listSections(objKey) {
+    const [dir, objName] = splitObjKey(objKey);
+    const def = await this.objectDef(dir, objName);
+    const sections = [];
+    const push = (key, label, icon, items) => {
+      if (items && items.length) sections.push({ key: objKey + "/" + key, label, icon, count: items.length, items });
+    };
+
+    const spec = SECTION_ORDER[dir] ?? ["attributes", "tabularSections", "forms", "commands", "templates"];
+    for (const s of spec) {
+      const items = await this.sectionItems(dir, objName, objKey, def, s);
+      if (!items.length) continue;
+      const meta = SECTION_META[s];
+      push(s, meta.label, meta.icon, items);
+    }
+
+    // Module files present on disk (Ext/*.bsl) — the reason this whole tree exists.
+    const modules = this.moduleLeafs(dir, objName);
+    if (modules.length) push("Модули", "Модули", "commonModule", modules);
+    return sections;
+  }
+
+  async sectionItems(dir, objName, objKey, def, s) {
+    const src = def[s];
+    if (!src || !src.length) return [];
+    const icon = SECTION_META[s].itemIcon;
+    switch (s) {
+      case "tabularSections":
+        return src.map((ts) => ({ key: objKey + "/tabularSections/" + ts.name, label: ts.name, icon: "tabularSection" }));
+      case "operations":
+        return src.map((op) => ({ key: objKey + "/operations/" + op.name, label: op.name, icon: "operation" }));
+      case "urlTemplates":
+        return src.map((u) => ({ key: objKey + "/urlTemplates/" + u.name, label: u.name, icon: "urlTemplate" }));
+      case "forms": {
+        const out = [];
+        for (const f of src) {
+          // Left click opens the form MODULE when it exists; the XML twin is
+          // offered via the context menu. If there is no module file, file is
+          // null and the client shows a notice instead of silently opening XML.
+          const moduleFile = this.formModuleFile(dir, objName, f.name);
+          const xmlFile = this.objFile(dir, objName, "Forms", f.name + ".xml");
+          out.push({
+            key: null,
+            label: f.name,
+            icon: "form",
+            file: moduleFile,
+            xmlFile,
+            hint: moduleFile ? "модуль" : "нет модуля",
+          });
+        }
+        return out;
+      }
+      case "commands": {
+        const out = [];
+        for (const c of src) {
+          const moduleFile = this.objFile(dir, objName, "Commands", c.name, "Ext", "CommandModule.bsl");
+          const xmlFile = this.objFile(dir, objName, "Commands", c.name + ".xml");
+          out.push({
+            key: null,
+            label: c.name,
+            icon: "command",
+            file: moduleFile,
+            xmlFile,
+            hint: moduleFile ? "модуль" : "нет модуля",
+          });
+        }
+        return out;
+      }
+      case "templates":
+        return src.map((t) => ({
+          key: null,
+          label: t.name,
+          icon: "template",
+          file: this.objFile(dir, objName, "Templates", t.name + ".xml"),
+          hint: "XML",
+        }));
+      default:
+        return src.map((x) => ({ key: null, label: x.name, icon }));
+    }
+  }
+
+  // --- object definitions (format-specific) -------------------------------
+
+  async objectDef(dir, objName) {
+    const cacheKey = dir + "/" + objName;
+    if (this.objCache.has(cacheKey)) return this.objCache.get(cacheKey);
+    let def = { name: objName };
+    try {
+      if (dir === EXT_DIR) {
+        // Внешний объект: описание <Имя>.xml + папка с формами/макетами/модулем.
+        const p = join(this.configRoot, EXT_DIR, objName + ".xml");
+        if (existsSync(p)) {
+          const root = makeParser().parse(await fs.readFile(p, "utf-8"));
+          const md = root.MetaDataObject;
+          const el = md ? md[Object.keys(md).find((k) => k !== "?xml")] : null;
+          if (el) def = this.fromExternalElement(el);
+        }
+        def = await this.mergeFolderChildren(dir, objName, def, true);
+      } else if (this.format === "edt") {
+        const p = join(this.configRoot, dir, objName, objName + ".mdo");
+        if (existsSync(p)) {
+          const root = makeParser().parse(await fs.readFile(p, "utf-8"));
+          const el = root[Object.keys(root).find((k) => k !== "?xml")];
+          def = this.fromMdoElement(el);
+        }
+      } else if (this.format === "xml") {
+        // ConfigDumpInfo.xml is the authoritative source of object structure.
+        await this.ensureFlat();
+        def = this.defFromFlat(dir, objName);
+        def = await this.mergeFolderChildren(dir, objName, def);
+      } else {
+        const p = join(this.configRoot, dir, objName + ".xml");
+        if (existsSync(p)) {
+          const root = makeParser().parse(await fs.readFile(p, "utf-8"));
+          const md = root.MetaDataObject;
+          const el = md ? md[Object.keys(md)[0]] : null;
+          if (el) def = this.fromXmlDumpElement(el);
+        }
+        // XML-dump formats also carry a folder on disk; use it as an
+        // additional source for forms/commands/templates when the def lacks them.
+        def = await this.mergeFolderChildren(dir, objName, def);
+      }
+    } catch (e) {
+      console.error("[dsh-bsl-editor] parse " + cacheKey, e);
+    }
+    this.objCache.set(cacheKey, def);
+    if (this.objCache.size > 600) {
+      const first = this.objCache.keys().next().value;
+      this.objCache.delete(first);
+    }
+    return def;
+  }
+
+  // Build the unified def from the flattened ConfigDumpInfo list.
+  // Flat entries: "Catalog.Товары.Attribute.Реквизит" (parts.length 4),
+  // "Catalog.Товары.TabularSection.ТЧ.Attribute.Рекв" (6), etc.
+  defFromFlat(dir, objName) {
+    const base = XML_PREFIX[dir] + objName + ".";
+    const items = (seg, depth) =>
+      this.flat
+        .filter((e) => e.name.startsWith(base + seg + ".") && e.parts.length === depth)
+        .map((e) => ({ name: e.parts[depth - 1] }));
+    const def = { name: objName };
+    const flatSections = [
+      ["attributes", "Attribute"],
+      ["forms", "Form"],
+      ["commands", "Command"],
+      ["templates", "Template"],
+      ["dimensions", "Dimension"],
+      ["resources", "Resource"],
+      ["enumValues", "EnumValue"],
+      ["columns", "Column"],
+      ["accountingFlags", "AccountingFlag"],
+      ["extDimensionAccountingFlags", "ExtDimensionAccountingFlag"],
+      ["addressingAttributes", "AddressingAttribute"],
+    ];
+    for (const [field, seg] of flatSections) {
+      const list = items(seg, 4);
+      if (list.length) def[field] = list;
+    }
+    const ts = items("TabularSection", 4);
+    if (ts.length) {
+      def.tabularSections = ts.map((t) => ({
+        name: t.name,
+        attributes: items("TabularSection." + t.name + ".Attribute", 6),
+      }));
+    }
+    const ops = items("Operation", 4);
+    if (ops.length) {
+      def.operations = ops.map((o) => ({
+        name: o.name,
+        parameters: items("Operation." + o.name + ".Parameter", 6),
+      }));
+    }
+    const urls = items("URLTemplate", 4);
+    if (urls.length) {
+      def.urlTemplates = urls.map((u) => ({
+        name: u.name,
+        methods: items("URLTemplate." + u.name + ".Method", 6),
+      }));
+    }
+    return def;
+  }
+
+  // EDT .mdo element → unified def. Lists are wrapped in plural containers
+  // (<attributes><attribute .../>...</attributes>); single items may parse as
+  // an object instead of an array, so extraction is tolerant of both shapes.
+  fromMdoElement(el) {
+    if (!el) return { name: "" };
+    const def = { name: el.name ?? "" };
+    const ITEM_TAGS = {
+      attributes: "attribute", tabularSections: "tabularSection", forms: "form",
+      commands: "command", templates: "template", dimensions: "dimension",
+      resources: "resource", enumValues: "enumValue", columns: "column",
+      accountingFlags: "accountingFlag", extDimensionAccountingFlags: "extDimensionAccountingFlag",
+      addressingAttributes: "addressingAttribute", operations: "operation",
+      urlTemplates: "urlTemplate",
+    };
+    for (const [field, itemTag] of Object.entries(ITEM_TAGS)) {
+      const items = mdoItems(el[field], itemTag);
+      if (!items.length) continue;
+      def[field] = items.map((x) => {
+        const o = { name: x.name ?? x["$_name"] ?? "" };
+        if (field === "tabularSections") o.attributes = mdoItems(x.attributes, "attribute").map((a) => ({ name: a.name ?? "" }));
+        if (field === "operations") o.parameters = mdoItems(x.parameters, "parameter").map((p) => ({ name: p.name ?? "" }));
+        if (field === "urlTemplates") o.methods = mdoItems(x.methods, "method").map((m) => ({ name: m.name ?? "" }));
+        return o;
+      });
+    }
+    return def;
+  }
+
+  // Object-by-object dump .xml (MetaDataObject) → unified def.
+  fromXmlDumpElement(el) {
+    const def = { name: el.Properties?.Name ?? "" };
+    const kids = (listName, itemTag) => {
+      const list = el[listName];
+      if (!list) return null;
+      return asArray(list[itemTag] ?? list).map((x) => {
+        const o = { name: x.Name ?? x["$_name"] ?? "" };
+        if (x.Attributes) o.attributes = asArray(x.Attributes.Attribute).map((a) => ({ name: a.Name ?? "" }));
+        return o;
+      });
+    };
+    def.attributes = kids("Attributes", "Attribute");
+    def.tabularSections = kids("TabularSections", "TabularSection");
+    def.forms = kids("Forms", "Form");
+    def.commands = kids("Commands", "Command");
+    def.templates = kids("Templates", "Template");
+    def.dimensions = kids("Dimensions", "Dimension");
+    def.resources = kids("Resources", "Resource");
+    def.enumValues = kids("EnumValues", "EnumValue") ?? kids("Values", "Value");
+    def.columns = kids("Columns", "Column");
+    def.accountingFlags = kids("AccountingFlags", "AccountingFlag");
+    def.extDimensionAccountingFlags = kids("ExtDimensionAccountingFlags", "ExtDimensionAccountingFlag");
+    def.addressingAttributes = kids("AddressingAttributes", "AddressingAttribute");
+    return def;
+  }
+
+  // Описание внешнего отчета/обработки (MetaDataObject): свойства и <ChildObjects>
+  // с именами реквизитов, табличных частей, форм, команд и макетов.
+  fromExternalElement(el) {
+    const def = { name: el.Properties?.Name ?? "" };
+    const co = el.ChildObjects && typeof el.ChildObjects === "object" ? el.ChildObjects : {};
+    const names = (tag) =>
+      asArray(co[tag])
+        .map((x) => ({ name: x && typeof x === "object" ? String(x.Name ?? "") : String(x ?? "") }))
+        .filter((x) => x.name);
+    for (const [field, tag] of [
+      ["attributes", "Attribute"],
+      ["tabularSections", "TabularSection"],
+      ["forms", "Form"],
+      ["commands", "Command"],
+      ["templates", "Template"],
+    ]) {
+      const items = names(tag);
+      if (items.length) def[field] = items;
+    }
+    return def;
+  }
+
+  // Folders on disk fill in forms/commands/templates even when the def xml
+  // carries only Properties (the object-by-object dump variant). union=true —
+  // добавить к списку описания то, что есть только на диске (внешние объекты:
+  // папка полнее <ChildObjects>).
+  async mergeFolderChildren(dir, objName, def, union = false) {
+    const base = join(this.configRoot, dir, objName);
+    const add = async (field, sub) => {
+      if (def[field] && !union) return;
+      let names;
+      try {
+        names = await fs.readdir(join(base, sub));
+      } catch {
+        if (!def[field]) def[field] = [];
+        return;
+      }
+      const fromDisk = names.filter((n) => n.endsWith(".xml")).map((n) => ({ name: n.slice(0, -4) }));
+      if (!def[field]) {
+        def[field] = fromDisk;
+        return;
+      }
+      const have = new Set(def[field].map((x) => x.name));
+      for (const it of fromDisk) if (!have.has(it.name)) def[field].push(it);
+    };
+    await add("forms", "Forms");
+    await add("commands", "Commands");
+    await add("templates", "Templates");
+    return def;
+  }
+
+  // --- file mapping --------------------------------------------------------
+
+  objFile(dir, objName, ...segs) {
+    const p = join(this.configRoot, dir, objName, ...segs);
+    return existsSync(p) ? p : null;
+  }
+
+  formModuleFile(dir, objName, formName) {
+    return this.objFile(dir, objName, "Forms", formName, "Ext", "Form", "Module.bsl");
+  }
+
+  moduleLeafs(dir, objName) {
+    const base = join(this.configRoot, dir, objName, "Ext");
+    if (!existsSync(base)) return [];
+    const out = [];
+    for (const [file, label] of Object.entries(MODULE_FILES)) {
+      if (existsSync(join(base, file))) out.push({ key: null, label, icon: "commonModule", file: join(base, file) });
+    }
+    const predef = join(base, "Predefined.xml");
+    if (existsSync(predef)) out.push({ key: null, label: "Предопределённые", icon: "common", file: predef });
+    return out;
+  }
+
+  // --- EDT helpers ---------------------------------------------------------
+
+  async ensureMdo() {
+    if (this.mdo) return;
+    const p = join(this.configRoot, "Configuration", "Configuration.mdo");
+    const root = makeParser().parse(await fs.readFile(p, "utf-8"));
+    this.mdo = root["mdclass:Configuration"] ?? root.Configuration ?? {};
+  }
+
+  mdoObjects(dir) {
+    const props = MDO_PROP[dir] ?? [camel(dir)[0]];
+    for (const prop of props) {
+      const arr = asArray(this.mdo[prop]);
+      if (arr.length) return arr.map((x) => x ?? "");
+    }
+    return [];
+  }
+
+  // --- XML (ConfigDumpInfo) helpers ----------------------------------------
+
+  async ensureFlat() {
+    if (this.flat) return;
+    const p = join(this.configRoot, "ConfigDumpInfo.xml");
+    const root = makeParser().parse(await fs.readFile(p, "utf-8"));
+    const list = [];
+    const walk = (nodes) => {
+      for (const n of asArray(nodes)) {
+        const name = n["$_name"];
+        if (name) list.push({ name, parts: name.split("."), id: n["$_id"] ?? "" });
+        if (n.Metadata) walk(n.Metadata);
+      }
+    };
+    walk(root.ConfigDumpInfo?.ConfigVersions?.Metadata);
+    this.flat = list;
+  }
+
+  groupIcon(dir) {
+    if (dir === EXT_DIR) return EXT_ICON;
+    return [...COMMON_GROUPS, ...MAIN_GROUPS].find(([d]) => d === dir)?.[2] ?? "common";
+  }
+
+  // --- search ---------------------------------------------------------------
+
+  async search(q) {
+    await this.init();
+    const needle = q.trim().toLowerCase();
+    if (!needle) return [];
+    const out = [];
+    const seen = new Set();
+    // Human-readable hierarchy path for a result: "Справочники / Товары",
+    // "Общие / Общие модули / Имя", ...
+    const pushResult = (o, dir, isCommon) => {
+      if (seen.has(o.key)) return;
+      seen.add(o.key);
+      const segs = String(o.key).split("/");
+      const path = [isCommon ? "Общие" : null, groupLabel(dir), ...segs.slice(1)].filter(Boolean).join(" / ");
+      out.push({ key: o.key, label: o.label, icon: o.icon, path, ...(o.file ? { file: o.file } : {}) });
+    };
+    for (const g of this.groupsCache ?? []) {
+      if (g.children) continue; // "Общие" — its groups are listed separately below
+      if (g.key && g.count) {
+        const objs = await this.listObjects(g.key);
+        for (const o of objs) {
+          if (o.label.toLowerCase().includes(needle)) {
+            pushResult(o, g.key, false);
+            if (out.length >= 300) return out;
+          }
+        }
+      } else if (g.file) {
+        if (g.label.toLowerCase().includes(needle)) out.push({ ...g, path: "Модули конфигурации" });
+      }
+    }
+    // "Общие" subgroups
+    const common = (this.groupsCache ?? []).find((g) => g.key === "Общие");
+    if (common) {
+      for (const sub of common.children ?? []) {
+        const objs = await this.listObjects(sub.key);
+        for (const o of objs) {
+          if (o.label.toLowerCase().includes(needle)) {
+            pushResult(o, sub.key, true);
+            if (out.length >= 300) return out;
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  // --- статическая навигация (F12 без языкового сервера) -------------------
+
+  // Разрешить вызов для F12. С точкой — «[Коллектор.]Модуль.Метод» через
+  // структуру метаданных (точный модуль). Без точки — объявление ищется
+  // только в currentFile (по всей конфигурации не ходим).
+  async resolveCall(call, currentFile = null) {
+    await this.init();
+    const parts = String(call).split(".").map((s) => s.trim()).filter(Boolean);
+    if (!parts.length) return { targets: [], resolved: true };
+    const method = parts[parts.length - 1];
+    if (parts.length >= 2) {
+      const ref = parts[parts.length - 2];
+      const collDir = parts.length >= 3 ? COLLECTORS[parts[parts.length - 3]] : null;
+      let candidates = [];
+      if (collDir && ref) candidates = this.moduleFilesForRef(ref, collDir);
+      if (!candidates.length && ref) candidates = this.moduleFilesForRef(ref);
+      if (candidates.length) {
+        const targets = [];
+        for (const { file } of candidates) {
+          const hit = await this.findMethodInFile(file, method);
+          if (hit) targets.push(hit);
+        }
+        if (targets.length) return { targets, resolved: true };
+      }
+      // ref не резолвится как модуль метаданных (переменная, ЭтотОбъект,
+      // этотФорма) — метод может быть объявлен в текущем модуле.
+      if (currentFile) {
+        const hit = await this.findMethodInFile(currentFile, method);
+        if (hit) return { targets: [hit], resolved: true };
+      }
+      return { targets: [], resolved: true };
+    }
+    if (currentFile) {
+      const hit = await this.findMethodInFile(currentFile, method);
+      return { targets: hit ? [hit] : [], resolved: true };
+    }
+    return { targets: [], resolved: true };
+  }
+
+  // Модули по имени объекта/модуля: DIRECT_MODULES (общие модули, HTTP-сервисы…)
+  // + менеджер/объект для групп; dirFilter сужает до одной группы.
+  moduleFilesForRef(ref, dirFilter) {
+    const out = [];
+    for (const [dir, parts] of Object.entries(DIRECT_MODULES)) {
+      if (dirFilter && dirFilter !== dir) continue;
+      const p = join(this.configRoot, dir, ref, ...parts);
+      if (existsSync(p)) out.push({ file: p, kind: dir });
+    }
+    for (const [dir] of MAIN_GROUPS) {
+      if (dirFilter && dirFilter !== dir) continue;
+      const base = join(this.configRoot, dir, ref, "Ext");
+      for (const f of ["ManagerModule.bsl", "ObjectModule.bsl"]) {
+        const p = join(base, f);
+        if (existsSync(p)) out.push({ file: p, kind: dir });
+      }
+    }
+    return out;
+  }
+
+  // Объявление «Процедура|Функция Имя(» в файле → { file, line, col } | null.
+  async findMethodInFile(file, name) {
+    try {
+      const lines = (await fs.readFile(file, "utf-8")).split(/\r?\n/);
+      const re = new RegExp("(?:Процедура|Функция)\\s+" + escapeRegExp(name) + "\\s*\\(", "i");
+      for (let i = 0; i < lines.length; i++) {
+        if (re.test(lines[i])) {
+          const col = lines[i].indexOf(name) + 1;
+          return { file, line: i + 1, col: col > 0 ? col : 1 };
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  // --- top-level dispatch ----------------------------------------------------
+
+  // --- changed filter (changedSet active → tree shows only touched objects) --
+
+  setChangedFilter(files) {
+    // null — снять фильтр (показывать всё); [] — фильтр активен, изменений нет
+    // (пустое дерево); массив путей — обычный активный фильтр.
+    this.changedCountsCache.clear();
+    if (files === null || files === undefined) { this.changedSet = null; return; }
+    const rootAbs = join(this.configRoot, "").replace(/\\/g, "/");
+    const norm = rootAbs.endsWith("/") ? rootAbs : rootAbs + "/";
+    const s = new Set();
+    for (const f of files) {
+      let p = String(f.path || "").replace(/\\/g, "/");
+      // git-status отдаёт пути относительно корня репозитория —
+      // приводим к абсолютному виду через configRoot.
+      if (!/^[a-zA-Z]:\//.test(p)) p = norm + p.replace(/^\.?\//, "");
+      if (!p.startsWith(norm)) continue;
+      s.add(p);
+      // Каталоги-предки: объект формата object — это папка; отметим и её.
+      let cur = p;
+      while (cur.length > norm.length) {
+        cur = cur.slice(0, cur.lastIndexOf("/"));
+        if (cur.length > norm.length) s.add(cur + "/");
+      }
+    }
+    this.changedSet = s;
+  }
+
+  // Есть ли среди изменённых файлов хоть один внутри объекта dir/objName.
+  objChanged(dir, objName) {
+    if (!this.changedSet) return true;
+    const prefix = join(this.configRoot, dir, objName, "").replace(/\\/g, "/");
+    for (const p of this.changedSet) {
+      if (p === prefix.slice(0, -1) || p.startsWith(prefix)) return true;
+    }
+    return false;
+  }
+
+  changedObjects(dir) {
+    const base = join(this.configRoot, dir, "").replace(/\\/g, "/");
+    const names = new Set();
+    for (const p of this.changedSet) {
+      if (!p.startsWith(base)) continue;
+      const rest = p.slice(base.length).replace(/^\/+/, "");
+      if (!rest) continue;
+      const top = rest.split("/")[0];
+      if (top.endsWith(".xml")) names.add(top.slice(0, -4));
+      else names.add(top);
+    }
+    return [...names].sort((a, b) => a.localeCompare(b, "ru")).map((name) => ({
+      key: dir + "/" + name,
+      label: name,
+      icon: dir === EXT_DIR ? this.extIcon(name) : this.groupIcon(dir),
+      count: 1,
+    }));
+  }
+
+  async filterGroups(groups) {
+    const out = [];
+    for (const g of groups) {
+      // Корневые модули конфигурации (key === null): показываем по наличию
+      // изменённого файла среди их file.
+      if (!g.key) {
+        const f = String(g.file || "").replace(/\\/g, "/");
+        if (f && this.changedSet?.has(f)) out.push({ ...g });
+        continue;
+      }
+      if (g.key === "Общие") {
+        const children = await this.filterGroups(g.children ?? []);
+        if (children.length) out.push({ ...g, children, count: children.length });
+        continue;
+      }
+      const n = this.changedObjects(g.key).length;
+      if (n > 0) out.push({ ...g, count: n });
+    }
+    return out;
+  }
+
+  async list(key) {
+    await this.init();
+    key = String(key || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    if (!key) {
+      const root = this.groupsCache ?? [];
+      return { items: this.changedSet ? await this.filterGroups(root) : root };
+    }
+    if (key === "Общие") {
+      const g = (this.groupsCache ?? []).find((x) => x.key === "Общие");
+      const items = g?.children ?? [];
+      return { items: this.changedSet ? await this.filterGroups(items) : items };
+    }
+    const segs = key.split("/");
+    if (segs.length === 1) {
+      if (this.changedSet) return { items: await this.changedObjects(segs[0]) };
+      return { items: await this.listObjects(segs[0]) };
+    }
+    if (segs.length === 2) {
+      const [dir, objName] = splitObjKey(key);
+      if (this.changedSet && !this.objChanged(dir, objName)) return { items: [] };
+      return { items: await this.listSections(key) };
+    }
+    const objKey = segs.slice(0, 2).join("/");
+    const [dir, objName] = splitObjKey(objKey);
+    if (segs.length === 3) {
+      // A section itself ("Catalogs/Товары/forms") — return its items.
+      const section = segs[2];
+      if (section === "Модули") return { items: await this.moduleLeafs(dir, objName) };
+      if (!SECTION_META[section]) return { items: [] };
+      const def = await this.objectDef(dir, objName);
+      return { items: await this.sectionItems(dir, objName, objKey, def, section) };
+    }
+    // deeper: a section item with nested children (tabular section attributes,
+    // web-service operation parameters, ...) — resolve from the parent object def
+    const def = await this.objectDef(dir, objName);
+    const section = segs[2];
+    const meta = SECTION_META[section];
+    if (!meta) return { items: [] };
+    const src = def[section] ?? [];
+    const item = src.find((x) => x.name === segs[3]);
+    if (!item) return { items: [] };
+    const children = item.attributes ?? item.parameters ?? item.methods ?? [];
+    return {
+      items: children.map((c) => ({ key: null, label: c.name, icon: meta.itemIcon })),
+    };
+  }
+}
+
+function splitObjKey(key) {
+  const i = key.indexOf("/");
+  return [key.slice(0, i), key.slice(i + 1)];
+}
+
+// ---------------------------------------------------------------------------
+// Section specs
+// ---------------------------------------------------------------------------
+
+const SECTION_META = {
+  attributes: { label: "Реквизиты", icon: "attribute", itemIcon: "attribute" },
+  tabularSections: { label: "Табличные части", icon: "tabularSection", itemIcon: "tabularSection" },
+  forms: { label: "Формы", icon: "form", itemIcon: "form" },
+  commands: { label: "Команды", icon: "command", itemIcon: "command" },
+  templates: { label: "Макеты", icon: "template", itemIcon: "template" },
+  dimensions: { label: "Измерения", icon: "dimension", itemIcon: "dimension" },
+  resources: { label: "Ресурсы", icon: "resource", itemIcon: "resource" },
+  enumValues: { label: "Значения", icon: "attribute", itemIcon: "attribute" },
+  columns: { label: "Графы", icon: "column", itemIcon: "column" },
+  accountingFlags: { label: "Признаки учета", icon: "accountingFlag", itemIcon: "accountingFlag" },
+  extDimensionAccountingFlags: { label: "Признаки учета субконто", icon: "extDimensionAccountingFlag", itemIcon: "extDimensionAccountingFlag" },
+  addressingAttributes: { label: "Реквизиты адресации", icon: "attribute", itemIcon: "attribute" },
+  operations: { label: "Операции", icon: "operation", itemIcon: "operation" },
+  urlTemplates: { label: "Шаблоны URL", icon: "urlTemplate", itemIcon: "urlTemplate" },
+  Модули: { label: "Модули", icon: "commonModule", itemIcon: "commonModule" },
+};
+
+const SECTION_ORDER = {
+  Catalogs: ["attributes", "tabularSections", "forms", "commands", "templates"],
+  Documents: ["attributes", "tabularSections", "forms", "commands", "templates"],
+  Reports: ["attributes", "tabularSections", "forms", "commands", "templates"],
+  DataProcessors: ["attributes", "tabularSections", "forms", "commands", "templates"],
+  ExchangePlans: ["attributes", "tabularSections", "forms", "commands", "templates"],
+  BusinessProcesses: ["attributes", "tabularSections", "forms", "commands", "templates"],
+  ChartsOfCharacteristicTypes: ["attributes", "tabularSections", "forms", "commands", "templates"],
+  ChartsOfCalculationTypes: ["attributes", "tabularSections", "forms", "commands", "templates"],
+  InformationRegisters: ["dimensions", "resources", "attributes", "forms", "commands", "templates"],
+  AccumulationRegisters: ["dimensions", "resources", "attributes", "forms", "commands", "templates"],
+  AccountingRegisters: ["dimensions", "resources", "attributes", "forms", "commands", "templates"],
+  CalculationRegisters: ["dimensions", "resources", "attributes", "forms", "commands", "templates"],
+  DocumentJournals: ["columns", "forms", "commands", "templates"],
+  Enums: ["enumValues", "forms", "commands", "templates"],
+  ChartsOfAccounts: ["accountingFlags", "extDimensionAccountingFlags", "attributes", "tabularSections", "forms", "commands", "templates"],
+  Tasks: ["addressingAttributes", "attributes", "tabularSections", "forms", "commands", "templates"],
+  WebServices: ["operations"],
+  HTTPServices: ["urlTemplates"],
+};
+
+const MODULE_FILES = {
+  "ObjectModule.bsl": "Модуль объекта",
+  "ManagerModule.bsl": "Модуль менеджера",
+  "RecordSetModule.bsl": "Модуль набора записей",
+  "RecordModule.bsl": "Модуль записи",
+  "ValueManagerModule.bsl": "Модуль менеджера значения",
+  "Module.bsl": "Модуль объекта (legacy)",
+};
+
+// Object types that ARE a single module file: the tree item opens the file
+// directly instead of nesting a «Модули» section.
+const DIRECT_MODULES = {
+  CommonModules: ["Ext", "Module.bsl"],
+  EventSubscriptions: ["Ext", "EventSubscriptionModule.bsl"],
+  ScheduledJobs: ["Ext", "ScheduledJobModule.bsl"],
+  WebServices: ["Ext", "Module.bsl"],
+  HTTPServices: ["Ext", "Module.bsl"],
+};
+
+// Платформенные коллекторы → группа метаданных (для «Справочники.X.Метод»).
+const COLLECTORS = {
+  "Справочники": "Catalogs",
+  "Документы": "Documents",
+  "Перечисления": "Enums",
+  "Отчеты": "Reports",
+  "Обработки": "DataProcessors",
+  "РегистрыСведений": "InformationRegisters",
+  "РегистрыНакопления": "AccumulationRegisters",
+  "РегистрыБухгалтерии": "AccountingRegisters",
+  "РегистрыРасчета": "CalculationRegisters",
+  "БизнесПроцессы": "BusinessProcesses",
+  "Задачи": "Tasks",
+  "ПланыВидовХарактеристик": "ChartsOfCharacteristicTypes",
+  "ПланыСчетов": "ChartsOfAccounts",
+  "ПланыВидовРасчета": "ChartsOfCalculationTypes",
+  "ВнешниеИсточникиДанных": "ExternalDataSources",
+  "Последовательности": "Sequences",
+  "ЖурналыДокументов": "DocumentJournals",
+  "Нумераторы": "DocumentNumerators",
+};
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const MODULE_LABELS = {
+  "ManagedApplicationModule.bsl": "Модуль приложения",
+  "SessionModule.bsl": "Модуль сеанса",
+  "ExternalConnectionModule.bsl": "Модуль внешнего соединения",
+};
+
+export const META_ICON_NAMES = new Set([
+  ...COMMON_GROUPS.map(([, , i]) => i),
+  ...MAIN_GROUPS.map(([, , i]) => i),
+  ...Object.values(SECTION_META).flatMap((m) => [m.icon, m.itemIcon]),
+  "operation", "parameter", "urlTemplate", "commonModule", EXT_ICON,
+]);
