@@ -466,6 +466,7 @@ export default async function plugin(bb: BbPluginApi) {
       const options = { signal, windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 };
       let executable = process.env.BB_CLI || "bb";
       let prefix: string[] = [];
+      const env: NodeJS.ProcessEnv = { ...process.env, BB_PROJECT_ID: scope.projectId, BB_THREAD_ID: scope.threadId ?? "" };
       if (process.platform === "win32" && !/\.exe$/i.test(executable)) {
         if (executable === "bb") {
           const { stdout } = await runCli("where.exe", ["bb.cmd"], options);
@@ -474,9 +475,10 @@ export default async function plugin(bb: BbPluginApi) {
           executable = join(dirname(executable), "bb");
         }
         // BB 0.50.1 can exit before its Windows IPC handles have closed.
-        // Drain the Node CLI process while preserving its original exit code.
+        // BB can delegate the command to another Node process, so pass the drain through its environment.
         const drain = "const exit = process.exit.bind(process); process.exit = code => setTimeout(() => exit(code), 100);";
-        prefix = ["--import", `data:text/javascript,${encodeURIComponent(drain)}`, executable];
+        env.NODE_OPTIONS = [env.NODE_OPTIONS, `--import=data:text/javascript,${encodeURIComponent(drain)}`].filter(Boolean).join(" ");
+        prefix = [executable];
         executable = "node.exe";
       }
       const { stdout } = await runCli(executable, [
@@ -484,7 +486,7 @@ export default async function plugin(bb: BbPluginApi) {
         "env-catalog", "get", name, "--raw", "--purpose", "1C Platform Operations",
       ], {
         ...options,
-        env: { ...process.env, BB_PROJECT_ID: scope.projectId, BB_THREAD_ID: scope.threadId ?? "" },
+        env,
       });
       return stdout.replace(/\r?\n$/, "");
     } catch {
