@@ -9,6 +9,7 @@ import type { ProjectReadiness, ProjectState } from "./contract.js";
 import { detectPlatforms, listInfoBases } from "./lib/infobases.js";
 import { OperationRunner } from "./lib/operations.js";
 import { PlatformOperations } from "./lib/platform-operations.js";
+import { DiagnosticReports, diagnosticArtifact } from "./lib/diagnostic-reports.js";
 import { physicalPath, planPlatformOperation, readPlatformProfiles, savePlatformProfile } from "./lib/platform-plan.js";
 import type { PlatformRequest } from "./platform-contract.js";
 import {
@@ -53,6 +54,10 @@ function getRunner(context: ExperimentalHostRpcContext): OperationRunner {
 
 function operationScope({ projectId, path }: { projectId: string; path: string }): string {
   return PlatformOperations.scope(projectId, physicalPath(resolve(path)));
+}
+
+function diagnosticReports(context: ExperimentalHostRpcContext): DiagnosticReports {
+  return new DiagnosticReports(join(context.experimental_paths.dataDir, "diagnostic-reports-v1"));
 }
 
 function resolvePlatformPlan(input: { path: string; source: string; fallback: string; request: PlatformRequest }, runner: PlatformOperations) {
@@ -178,6 +183,12 @@ export default experimental_defineHostEntry({
     platformJournal(input, context) {
       return getRunner(context).platform.list(operationScope(input));
     },
+    diagnosticReports(input, context) {
+      return diagnosticReports(context).list(operationScope(input));
+    },
+    diagnosticImport(input, context) {
+      return diagnosticReports(context).import(operationScope(input), physicalPath(resolve(input.path)), input.report);
+    },
     platformStatus(input, context) {
       return getRunner(context).platform.status(operationScope(input), input.id);
     },
@@ -185,6 +196,9 @@ export default experimental_defineHostEntry({
       return getRunner(context).platform.cancel(operationScope(input), input.id);
     },
     platformArtifact(input, context) {
+      if (diagnosticArtifact(input.name)) {
+        return { text: diagnosticReports(context).read(operationScope(input), input.id, input.name) };
+      }
       return { text: getRunner(context).platform.report(operationScope(input), input.id, input.name) };
     },
     passport({ path }) {

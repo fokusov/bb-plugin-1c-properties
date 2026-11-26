@@ -110,18 +110,42 @@ export const platformRunOptions = {
   confirmation: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   inspected: platformRunIdSchema.optional(),
 };
-export const platformArtifactNameSchema = z.string().regex(/^(operation\.log|junit-\d+\.xml)$/);
+export const platformArtifactNameSchema = z.string().regex(/^(operation\.log|junit-\d+\.xml|bsl-json\.json|apk-junit\.xml)$/);
+export const diagnosticToolSchema = z.enum(["bsl-ls", "apk"]);
+export const diagnosticImportSchema = z.object({
+  tool: diagnosticToolSchema,
+  file: field,
+  finishedAt: z.iso.datetime({ offset: true }),
+  revision: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i).optional(),
+  profile: profileNameSchema.default("project"),
+}).strict();
+const reportReference = z.object({ id: platformRunIdSchema, name: platformArtifactNameSchema }).strict();
+export const diagnosticReportSchema = diagnosticImportSchema.omit({ file: true, revision: true }).extend({
+  revision: z.string().nullable(),
+  counts: z.object({ errors: z.number().int().nonnegative(), warnings: z.number().int().nonnegative().nullable(), total: z.number().int().nonnegative() }).strict(),
+  report: reportReference,
+}).strict();
+export type DiagnosticImport = z.infer<typeof diagnosticImportSchema>;
+export type DiagnosticReport = z.infer<typeof diagnosticReportSchema>;
+
+const dashboardEntry = platformJournalEntrySchema.pick({
+  id: true, action: true, profile: true, kind: true, state: true, startedAt: true, finishedAt: true,
+  revision: true, dirty: true, needsInspection: true, counts: true,
+}).extend({ reports: z.array(reportReference) }).strict();
 export const platformDashboardContract = {
   platformDashboardV1: {
     input: platformScopeSchema,
     output: z.object({
       version: z.literal(1),
-      entries: z.array(platformJournalEntrySchema.pick({
-        id: true, action: true, profile: true, kind: true, state: true, startedAt: true, finishedAt: true,
-        revision: true, dirty: true, needsInspection: true, counts: true,
-      }).extend({
-        reports: z.array(z.object({ id: platformRunIdSchema, name: platformArtifactNameSchema }).strict()),
-      }).strict()),
+      entries: z.array(dashboardEntry),
+    }).strict(),
+  },
+  platformDashboardV2: {
+    input: platformScopeSchema,
+    output: z.object({
+      version: z.literal(2),
+      entries: z.array(dashboardEntry.extend({ platformVersion: z.string().nullable() })),
+      diagnostics: z.array(diagnosticReportSchema).max(4),
     }).strict(),
   },
 } as const;
@@ -145,6 +169,11 @@ export const platformHostMethods = {
     output: platformJournalEntrySchema,
   },
   platformJournal: { input: z.object(hostScope).strict(), output: z.array(platformJournalEntrySchema) },
+  diagnosticReports: { input: z.object(hostScope).strict(), output: z.array(diagnosticReportSchema).max(4) },
+  diagnosticImport: {
+    input: z.object({ ...hostScope, report: diagnosticImportSchema }).strict(),
+    output: diagnosticReportSchema,
+  },
   platformStatus: {
     input: z.object({ ...hostScope, id: platformRunIdSchema }).strict(),
     output: platformJournalEntrySchema.nullable(),

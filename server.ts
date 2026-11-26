@@ -26,10 +26,12 @@ import { WORKFLOW_DISABLED } from "./lib/bslflow-fields.js";
 import { shouldExposeRlmTools } from "./lib/agent-tools.js";
 import { registerReview } from "./lib/review-server.js";
 import {
-  platformActions, platformArtifactNameSchema, platformDashboardContract, platformProfileSchema, platformRequestSchema,
+  diagnosticImportSchema, platformActions, platformArtifactNameSchema, platformDashboardContract, platformProfileSchema, platformRequestSchema,
   platformRunIdSchema, platformRunOptions, platformScopeSchema,
+  type PlatformJournalEntry,
   type PlatformPreview, type PlatformRequest, type PlatformScope,
 } from "./platform-contract.js";
+import { recordedPlatformVersion } from "./lib/infobases.js";
 
 const CHANGED = "projects-changed";
 const runCli = promisify(execFile);
@@ -551,20 +553,36 @@ export default async function plugin(bb: BbPluginApi) {
     files: (path, hostId, target) => host.call("reviewFiles", { path, target }, { hostId }),
   });
 
+  function dashboardEntry({ id, action, profile, kind, state, startedAt, finishedAt, revision, dirty, needsInspection, counts, artifacts }: PlatformJournalEntry) {
+    return {
+      id, action, profile, kind, state, startedAt, finishedAt, revision, dirty, needsInspection, counts,
+      reports: artifacts.filter(({ kind }) => kind === "report" || kind === "log")
+        .map(({ name }) => ({ id, name: platformArtifactNameSchema.parse(name) })),
+    };
+  }
+
   bb.rpc.register(platformDashboardContract, {
     async platformDashboardV1(scope) {
       const { hostScope, hostId } = await operationTarget(scope);
       const entries = await host.call("platformJournal", hostScope, { hostId });
       return {
         version: 1 as const,
-        entries: entries.map(({ id, action, profile, kind, state, startedAt, finishedAt, revision, dirty, needsInspection, counts, artifacts }) => ({
-          id, action, profile, kind, state, startedAt, finishedAt, revision, dirty, needsInspection, counts,
-          reports: artifacts.filter(({ kind }) => kind === "report" || kind === "log")
-            .map(({ name }) => ({ id, name: platformArtifactNameSchema.parse(name) })),
-        })),
+        entries: entries.map(dashboardEntry),
       };
     },
-  }, { experimental_discoverable: true, experimental_description: "Сводка операций 1С для дашборда, версия 1" });
+    async platformDashboardV2(scope, { experimental_signal: signal }) {
+      const { hostScope, hostId } = await operationTarget(scope);
+      const [entries, diagnostics] = await Promise.all([
+        host.call("platformJournal", hostScope, { hostId, signal }),
+        host.call("diagnosticReports", hostScope, { hostId, signal }),
+      ]);
+      return {
+        version: 2 as const,
+        entries: entries.map((entry) => ({ ...dashboardEntry(entry), platformVersion: recordedPlatformVersion(entry.platform) })),
+        diagnostics,
+      };
+    },
+  }, { experimental_discoverable: true, experimental_description: "Сводка операций и диагностик 1С для дашборда" });
 
   bb.rpc.register(rpcContract, {
     async platformProfiles(scope) {
@@ -1140,6 +1158,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   const VALUE_OPTIONS = new Set([
     "thread", "environment", "profile", "input", "output", "extension", "config", "confirm", "inspected", "artifact",
+    "finished-at", "revision",
     "dir",
     "format",
     "timeout",
@@ -1202,7 +1221,7 @@ export default async function plugin(bb: BbPluginApi) {
     context: { projectId?: string; threadId?: string; signal?: AbortSignal },
   ) {
     const [verb = "help", first] = positionals;
-    const reference = (["preview", "run", "show", "cancel", "artifact"].includes(verb) ? positionals[2] : first) ?? values.get("project");
+    const reference = (["preview", "run", "show", "cancel", "artifact", "import-diagnostics"].includes(verb) ? positionals[2] : first) ?? values.get("project");
     const respond = (value: unknown, message = "", exitCode = 0) => ({
       exitCode, stdout: flags.has("json") ? JSON.stringify(value, null, 2) : message || JSON.stringify(value, null, 2),
     });
@@ -1215,6 +1234,8 @@ export default async function plugin(bb: BbPluginApi) {
         "bb 1c-properties platform profiles|journal [проект] [--json]",
         "bb 1c-properties platform save-profile [проект] --args-file <JSON>",
         "bb 1c-properties platform show|cancel|artifact <ID> [проект] [--artifact ИМЯ]",
+        "bb 1c-properties platform import-diagnostics bsl-ls|apk [проект]",
+        "  --environment ID --input ПУТЬ --finished-at ISO8601 [--revision SHA] [--profile ИМЯ] [--json]",
         "", ...Object.entries(platformActions).map(([name, label]) => `  ${name}  ${label}`),
       ].join("\n"));
     }
@@ -1236,6 +1257,14 @@ export default async function plugin(bb: BbPluginApi) {
       }
       case "journal":
         return respond(await host.call("platformJournal", hostScope, options));
+      case "import-diagnostics": {
+        if (!scope.threadId && !scope.environmentId) throw new Error("Выбери рабочую копию через --environment или --thread.");
+        const report = diagnosticImportSchema.parse({
+          tool: first, file: values.get("input"), finishedAt: values.get("finished-at"),
+          revision: values.get("revision"), profile: values.get("profile"),
+        });
+        return respond(await host.call("diagnosticImport", { ...hostScope, report }, options));
+      }
       case "show":
       case "cancel": {
         const id = platformRunIdSchema.parse(first);

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { platformRequestSchema } from "../platform-contract.js";
+import { diagnosticImportSchema, platformRequestSchema } from "../platform-contract.js";
+import { DiagnosticReports } from "../lib/diagnostic-reports.js";
+import { recordedPlatformVersion } from "../lib/infobases.js";
 import { PlatformJournal, readJUnit, redactLog } from "../lib/platform-journal.js";
 import { planPlatformOperation } from "../lib/platform-plan.js";
 
@@ -66,4 +68,42 @@ test("JUnit distinguishes failed and empty runs, and stored logs mask authentica
   assert.throws(() => readJUnit('<testsuite tests="1" failures="2"/>'), /счётчики/);
   assert.equal(redactLog('Pwd="unlisted secret" /UCsecret literal pa&amp;ss', ["pa&ss"]), "*** *** literal ***");
   assert.equal(redactLog("C:/Users/Test/.bb/plugins/1c-properties", []), "C:/Users/Test/.bb/plugins/1c-properties");
+});
+
+test("diagnostic imports preserve real report counts, keep scope and time, and refuse invalid data", (t) => {
+  const temp = mkdtempSync(join(tmpdir(), "bb-quality-"));
+  t.after(() => rmSync(temp, { recursive: true, force: true }));
+  const dir = realpathSync.native(temp);
+  const workspace = join(dir, "a");
+  mkdirSync(workspace);
+  const store = new DiagnosticReports(join(dir, "data"));
+  const json = JSON.stringify({ sourceDir: workspace, fileinfos: [{ path: "module.bsl",
+    diagnostics: [{ severity: "Error", code: "Missing" }, { severity: "Warning", code: "Other" }, { severity: "Hint", code: "Hint" }] }] });
+  writeFileSync(join(workspace, "output.json"), json);
+  const input = diagnosticImportSchema.parse({
+    tool: "bsl-ls", file: "output.json", revision: "A".repeat(40), finishedAt: "2026-01-01T12:00:00+03:00",
+  });
+  const first = store.import("scope-a", workspace, input);
+  assert.equal(first.finishedAt, "2026-01-01T09:00:00.000Z");
+  assert.equal(first.revision, "a".repeat(40));
+  assert.deepEqual(first.counts, { errors: 1, warnings: 1, total: 3 });
+  assert.equal(store.import("scope-a", workspace, input).report.id, first.report.id);
+  assert.equal(store.read("scope-a", first.report.id, first.report.name), json);
+  assert.throws(() => store.read("scope-b", first.report.id, first.report.name), /не найден/);
+  assert.throws(() => store.import("scope-a", workspace, { ...input, file: "../outside.json" }), /пределами/);
+  assert.throws(() => store.import("scope-a", workspace, { ...input, tool: "apk" }), /JUnit/);
+  const newer = store.import("scope-a", workspace, { ...input, finishedAt: "2026-01-02T00:00:00Z", revision: undefined });
+  assert.deepEqual(store.list("scope-a"), [newer, first]);
+  assert.equal(newer.revision, null);
+  const junit = '<testsuite tests="4" errors="1" failures="2" skipped="0"/>';
+  writeFileSync(join(workspace, "apk.xml"), junit);
+  const apk = store.import("scope-a", workspace, { ...input, tool: "apk", file: "apk.xml" });
+  assert.deepEqual(apk.counts, { errors: 3, warnings: null, total: 4 });
+  assert.equal(store.read("scope-a", apk.report.id, apk.report.name), junit);
+});
+
+test("dashboard returns a version only for a recorded installation path", () => {
+  assert.equal(recordedPlatformVersion("C:\\Program Files\\1cv8\\8.5.1.1529\\bin\\1cv8.exe"), "8.5.1.1529");
+  assert.equal(recordedPlatformVersion("C:/1C/8.3.27.1000/Bin/1cv8c.exe"), "8.3.27.1000");
+  assert.equal(recordedPlatformVersion("D:/custom/1cv8.exe"), null);
 });

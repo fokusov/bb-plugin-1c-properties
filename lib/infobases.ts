@@ -77,6 +77,11 @@ function commonInfoBaseFiles(): string[] {
   return files;
 }
 
+/** Version named in a recorded 1C installation path. */
+export function recordedPlatformVersion(executable: string): string | null {
+  return executable.match(/(?:^|[\\/])(8\.\d+\.\d+\.\d+)[\\/]bin[\\/]1cv8[cs]?\.exe$/i)?.[1] ?? null;
+}
+
 /** Find every installed platform with `bin\1cv8.exe`, newest first. */
 export function detectPlatforms(): PlatformInfo[] {
   const roots = [
