@@ -7,6 +7,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, r
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { isMap, parseDocument } from "yaml";
 import type { BslFlowState, SkillsState } from "../contract.js";
 import { canonical } from "./shared.js";
 import { readWorkflowEnabled } from "./bslflow-config.js";
@@ -81,17 +82,21 @@ function versionFrom(text: string): string {
   return match ? match[1].trim().replaceAll('"', "").replaceAll("'", "") : "";
 }
 
-/** What BSL Flow left in the project: the files the bootstrap validates. */
-export function detectBslFlow(projectPath: string): BslFlowState {
-  const sentinel = join(projectPath, ".bsl-flow", "project.yaml");
+export function readOpenSpecSchema(projectPath: string): string {
   const openspec = join(projectPath, "openspec", "config.yaml");
-  let openspecSchema = "";
   try {
-    const match = readFileSync(openspec, "utf-8").match(/^\s*schema\s*:\s*([^\s#]+)/m);
-    openspecSchema = match ? match[1].trim().replaceAll('"', "").replaceAll("'", "") : "";
-  } catch {
-    openspecSchema = "";
+    const doc = parseDocument(readFileSync(openspec, "utf-8"));
+    if (doc.errors.length || !isMap(doc.contents)) return "некорректная конфигурация";
+    const schema = doc.get("schema");
+    return typeof schema === "string" && schema.trim() ? schema.trim() : "схема не указана";
+  } catch (cause) {
+    return (cause as NodeJS.ErrnoException).code === "ENOENT" ? "" : "конфигурация недоступна";
   }
+}
+
+/** What BSL Flow left in the project: the files the bootstrap validates. */
+export function detectBslFlow(projectPath: string, openspecSchema = readOpenSpecSchema(projectPath)): BslFlowState {
+  const sentinel = join(projectPath, ".bsl-flow", "project.yaml");
   let version = "";
   try {
     version = versionFrom(readFileSync(sentinel, "utf-8"));

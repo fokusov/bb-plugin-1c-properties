@@ -13,6 +13,7 @@ import { z } from "zod";
 import { hostContract } from "./contract.js";
 import type {
   ProjectParams,
+  ProjectReadiness,
   ProjectState,
 } from "./contract.js";
 import type { ProjectRow } from "./rpc.js";
@@ -32,6 +33,12 @@ import {
 
 const CHANGED = "projects-changed";
 const runCli = promisify(execFile);
+const DISABLED_WORKFLOW_INSTRUCTIONS = [
+  "Для этого проекта в BB явно выключен BSL Flow (workflow.enabled: false).",
+  "Используй обычные правила проекта. Это решение действует и при наличии скиллов BSL Flow, bootstrap-файлов и общих инструкций для проектов 1С.",
+  "Для этой задачи пропусти BSL Flow, его скиллы (включая 1c-spec, 1c-spec-review, 1c-task) и Council. Ревью выполняй обычным маршрутом проекта.",
+  "Если при создании изменения OpenSpec в openspec/config.yaml осталась схема bsl-flow, явно передай --schema spec-driven в openspec new change либо выбери другую обычную схему, указанную проектом. Сохрани существующие настройки и изменения.",
+].join("\n");
 
 interface ProjectTarget {
   projectId: string;
@@ -167,13 +174,18 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  /** Project + the source folder and machine its parameters belong to. */
-  async function resolveTarget(projectId: string): Promise<ProjectTarget> {
+  async function resolveProjectSource(projectId: string) {
     const project = await bb.sdk.projects.get({ projectId });
     const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
     if (source === undefined) {
       throw new Error(`у проекта «${project.name}» нет папки-источника`);
     }
+    return { project, source };
+  }
+
+  /** Project + the source folder and machine its parameters belong to. */
+  async function resolveTarget(projectId: string): Promise<ProjectTarget> {
+    const { project, source } = await resolveProjectSource(projectId);
     return {
       projectId: project.id,
       name: project.name,
@@ -184,10 +196,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function readState(target: ProjectTarget): Promise<ProjectState> {
-    const state = await host.call("projectState", { path: target.path }, { hostId: target.hostId });
-    if (state.bslflow.enabled === null) workflowEnabled.delete(target.projectId);
-    else workflowEnabled.set(target.projectId, state.bslflow.enabled);
-    return state;
+    return host.call("projectState", { path: target.path }, { hostId: target.hostId });
   }
 
   function rowFrom(target: ProjectTarget, state: ProjectState, common: { platformPath: string }): ProjectRow {
@@ -445,7 +454,7 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error("Рабочая копия проекта недоступна.");
     }
     const target = { ...project, path: environment.path, hostId: environment.hostId };
-    return { project, target, source: target.hostId === project.hostId ? project.path : target.path };
+    return { project, target, source: target.hostId === project.hostId ? project.path : target.path, environmentId };
   }
 
   async function operationTarget(scope: PlatformScope) {
@@ -589,6 +598,53 @@ export default async function plugin(bb: BbPluginApi) {
       return host.call("platformArtifact", { ...hostScope, id, name }, { hostId });
     },
     async editorAvailability() { return { available: await editorAvailable(bb) }; },
+    async projectReadiness({ probeUnica, ...scope }, { experimental_signal: signal }) {
+      const { project, target, source, environmentId } = await resolvePlatformScope(scope);
+      const { platformPath } = await readCommon();
+      const options = { hostId: target.hostId, signal };
+      const [files, testBase, inventory, name] = await Promise.all([
+        host.call("readinessFiles", { path: target.path }, options),
+        host.call("readinessTestBase", { path: target.path, source, platform: platformPath }, options),
+        bb.sdk.plugins.list(),
+        target.hostId === project.hostId ? project.hostName : hostName(target.hostId),
+      ]);
+      let unica: ProjectReadiness["unica"] = {
+        status: "missing", detail: "Установите и включите bb-unica, чтобы проверять исходники из этого каталога.",
+      };
+      if (inventory.plugins.some(({ id, enabled }) => id === "bb-unica" && enabled)) {
+        try {
+          const report = await bb.sdk.plugins.callRpc({
+            pluginId: "bb-unica",
+            method: "diagnose",
+            input: { projectId: scope.projectId, ...(environmentId ? { environmentId } : {}), probe: probeUnica === true },
+            outputSchema: z.object({
+              path: z.string(),
+              runtime: z.object({ status: z.string(), packageVersion: z.string() }),
+              source: z.object({ ok: z.boolean(), workspaceRoot: z.string().optional() }).nullable(),
+            }),
+            signal,
+          });
+          const samePath = (left: string, right: string) => left.replaceAll("\\", "/").replace(/\/$/, "") === right.replaceAll("\\", "/").replace(/\/$/, "");
+          if (!samePath(report.path, target.path)) {
+            unica = { status: "error", detail: "Unica вернула другое рабочее окружение." };
+          } else if (report.source?.ok && report.source.workspaceRoot && samePath(report.source.workspaceRoot, target.path)) {
+            unica = { status: "ready", detail: "Unica прочитала исходники из этого каталога." };
+          } else if (report.runtime.status !== "ready") {
+            unica = { status: "missing", detail: "Подготовьте рантайм на машине окружения во вкладке bb-unica." };
+          } else if (probeUnica) {
+            unica = { status: "error", detail: "Чтение исходников не подтверждено. Проверьте диагностику bb-unica." };
+          } else {
+            unica = { status: "unchecked", detail: "Рантайм установлен. Проверьте чтение исходников." };
+          }
+        } catch {
+          unica = { status: "unchecked", detail: "Диагностика bb-unica недоступна. Проверьте плагин на машине окружения." };
+        }
+      }
+      return {
+        projectPath: project.path, path: target.path, hostName: name, files, testBase, unica,
+        editor: !inventory.plugins.some(({ id, enabled }) => id === "bsl-editor" && enabled),
+      };
+    },
     async passport({ projectId, environmentId }, { experimental_signal: signal }) {
       const project = await bb.sdk.projects.get({ projectId });
       const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
@@ -1013,10 +1069,29 @@ export default async function plugin(bb: BbPluginApi) {
   // steers. A failure reported as `isError` therefore reaches nobody once the
   // turn has ended, so failures that happen after the form was opened are
   // returned as a successful result whose text states the failure explicitly.
+  // The configure callback is synchronous. Refresh the project setting on the
+  // source host before dispatch, including when nobody has opened the card yet.
+  bb.experimental_hooks.on("message.dispatch", async ({ attempt, project }) => {
+    if (attempt === "start-turn" && project.kind === "standard") {
+      try {
+        const { source } = await resolveProjectSource(project.id);
+        const enabled = await host.call("workflowEnabled", { path: source.path }, {
+          hostId: source.hostId, timeoutMs: 2_000,
+        });
+        if (enabled === null) workflowEnabled.delete(project.id);
+        else workflowEnabled.set(project.id, enabled);
+      } catch (error) {
+        workflowEnabled.delete(project.id);
+        bb.log.warn(`Не удалось прочитать режим BSL Flow проекта ${project.id}: ${errorText(error)}`);
+      }
+    }
+    return { action: "proceed" };
+  });
+
   bb.agents.configure((context) => {
     const isOneC = projectKinds.get(context.project.id) ?? true;
     const instructions = workflowEnabled.get(context.project.id) === false
-      ? "В основном каталоге проекта BSL Flow отключён (workflow.enabled: false). Для новых задач используй обычные инструкции проекта и не запускай BSL Flow или Council."
+      ? DISABLED_WORKFLOW_INSTRUCTIONS
       : undefined;
     if (!isOneC) {
       return { tools: ["project_1c_params"], skills: ["1c-project-properties"], instructions };

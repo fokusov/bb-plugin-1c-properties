@@ -54,6 +54,10 @@ function toolExists(name: string): string {
   return found.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)[0] ?? "";
 }
 
+export function hasOpenSpecCli(): boolean {
+  return toolExists("openspec") !== "";
+}
+
 function stateFile(dataDir: string): string {
   return join(dataDir, "tools", "state.json");
 }
@@ -259,7 +263,7 @@ function installBslFlow(dataDir: string, latest: { version: string; commit: stri
     log.push("не найден pwsh — установи PowerShell 7");
     return false;
   }
-  if (toolExists("openspec") === "") {
+  if (!hasOpenSpecCli()) {
     log.push("не найден openspec — установи OpenSpec CLI");
     return false;
   }

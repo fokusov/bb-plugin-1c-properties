@@ -9,6 +9,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { rpcContract } from "../rpc.js";
 import { PlatformOperationsPanel } from "../components/platform-operations.js";
+import { ProjectReadinessCard } from "../components/project-readiness.js";
 import { Button } from "../components/ui/button.js";
 import "./style.css";
 
@@ -26,19 +27,23 @@ function useEditorAvailable() {
 function ThreadEditor({ threadId, environment }: ExperimentalThreadTabProps) {
   const { projectId } = useBbContext();
   const editorAvailable = useEditorAvailable();
-  const [mode, setMode] = useState<"editor" | "operations">("editor");
+  const [mode, setMode] = useState<"editor" | "operations" | "readiness">("editor");
   if (!environment || !projectId) return null;
-  const operations = mode === "operations" || !editorAvailable;
+  const current = mode === "editor" && !editorAvailable ? "operations" : mode;
+  const scope = { projectId, threadId, environmentId: environment.id };
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {editorAvailable && <div className="flex gap-1 border-b border-border px-2 py-1">
-        <Button size="sm" variant={operations ? "ghost" : "secondary"} onClick={() => setMode("editor")}>Редактор</Button>
-        <Button size="sm" variant={operations ? "secondary" : "ghost"} onClick={() => setMode("operations")}>Операции</Button>
-      </div>}
+      <div className="flex gap-1 border-b border-border px-2 py-1">
+        {editorAvailable && <Button size="sm" variant={current === "editor" ? "secondary" : "ghost"} onClick={() => setMode("editor")}>Редактор</Button>}
+        <Button size="sm" variant={current === "operations" ? "secondary" : "ghost"} onClick={() => setMode("operations")}>Операции</Button>
+        <Button size="sm" variant={current === "readiness" ? "secondary" : "ghost"} onClick={() => setMode("readiness")}>Готовность</Button>
+      </div>
       <div className="min-h-0 flex-1 overflow-auto">
-        {operations ? (
+        {current === "readiness" ? (
+          <div className="p-3"><ProjectReadinessCard key={environment.id} scope={scope} /></div>
+        ) : current === "operations" ? (
           <div className="p-3">
-            <PlatformOperationsPanel key={environment.id} scope={{ projectId, threadId, environmentId: environment.id }} />
+            <PlatformOperationsPanel key={environment.id} scope={scope} />
           </div>
         ) : (
           <div className="bsl-editor-root">

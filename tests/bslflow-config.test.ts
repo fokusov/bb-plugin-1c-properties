@@ -3,8 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { loadBslFlowConfig, parseConfig, readWorkflowEnabled, saveBslFlowConfig } from "../lib/bslflow-config.js";
-import { connectSkills, initProject } from "../lib/bslflow.js";
+import { loadBslFlowConfig, parseConfig, readWorkflowEnabled, reviewReadiness, saveBslFlowConfig } from "../lib/bslflow-config.js";
+import { connectSkills, initProject, readOpenSpecSchema } from "../lib/bslflow.js";
 
 const configText = [
   "# Project comment", "version: 2", "workflow:", "  mode: assisted", "review:", "  council:",
@@ -19,6 +19,29 @@ function fixture(t: { after(action: () => void): void }) {
   writeFileSync(path, configText);
   return { root, path };
 }
+
+test("readiness distinguishes an unprepared checkout from an existing incompatible schema", (t) => {
+  const { root } = fixture(t);
+  assert.equal(readOpenSpecSchema(root), "");
+  const path = join(root, "openspec", "config.yaml");
+  mkdirSync(join(root, "openspec"));
+  writeFileSync(path, "context: test\n");
+  assert.equal(readOpenSpecSchema(root), "схема не указана");
+  writeFileSync(path, "schema: 'spec-driven' # Existing OpenSpec\n");
+  assert.equal(readOpenSpecSchema(root), "spec-driven");
+  assert.equal(readFileSync(path, "utf8"), "schema: 'spec-driven' # Existing OpenSpec\n");
+});
+
+test("review configuration is reported separately from verified results", (t) => {
+  const { root, path } = fixture(t);
+  assert.equal(reviewReadiness(root).status, "missing");
+  writeFileSync(path, "review:\n  reviewer:\n    provider: codex_exec\n    model: fixture-model\n");
+  const configured = reviewReadiness(root);
+  assert.equal(configured.status, "unchecked");
+  assert.doesNotMatch(configured.detail, /fixture-model/);
+  writeFileSync(path, "workflow:\n  enabled: false\n");
+  assert.equal(reviewReadiness(root).status, "disabled");
+});
 
 test("workflow and Council can be changed and restored while retaining other settings", (t) => {
   const { root, path } = fixture(t);

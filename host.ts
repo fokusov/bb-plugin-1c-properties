@@ -5,7 +5,7 @@ import { inspectSourceGit } from "./lib/source-git.js";
 import { findReviewEvidence, readReviewHead, verifyReviewSource } from "./lib/review-source.js";
 import { readPassport } from "./lib/passport.js";
 import { hostContract } from "./contract.js";
-import type { ProjectState } from "./contract.js";
+import type { ProjectReadiness, ProjectState } from "./contract.js";
 import { detectPlatforms, listInfoBases } from "./lib/infobases.js";
 import { OperationRunner } from "./lib/operations.js";
 import { PlatformOperations } from "./lib/platform-operations.js";
@@ -25,12 +25,14 @@ import {
   connectSkills,
   detectBslFlow,
   initProject,
+  readOpenSpecSchema,
   readSkillsState,
 } from "./lib/bslflow.js";
 import { RlmRunner } from "./lib/rlm.js";
-import { loadBslFlowConfig, saveBslFlowConfig } from "./lib/bslflow-config.js";
+import { loadBslFlowConfig, readWorkflowEnabled, reviewReadiness, saveBslFlowConfig } from "./lib/bslflow-config.js";
 import { runCleanup, scanCleanup } from "./lib/cleanup.js";
 import {
+  hasOpenSpecCli,
   toolsCheck,
   toolsEnsure as ensureTools,
   toolsStatus,
@@ -110,6 +112,34 @@ function projectState(projectPath: string, context: ExperimentalHostRpcContext):
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
+    readinessFiles({ path }, context) {
+      const { exists, markers } = detectProject(path);
+      const schema = readOpenSpecSchema(path);
+      return {
+        exists, hasSources: markers.length > 0, git: inspectSourceGit(path), schema, openspecCli: hasOpenSpecCli(),
+        flow: detectBslFlow(path, schema), skills: readSkillsState(path),
+        core: toolsStatus(context.experimental_paths.dataDir).bslflow,
+        review: reviewReadiness(path),
+      };
+    },
+    readinessTestBase({ path, source, platform }): ProjectReadiness["testBase"] {
+      try {
+        const hasTestProfile = readPlatformProfiles(source).some(({ kind }) => kind === "test");
+        if (hasTestProfile) {
+          return { status: "unchecked", detail: "Есть профиль test. Проверьте подключение к выбранной цели в операциях 1С." };
+        }
+        const local = readParams(path);
+        const { infobasePath, platformPath } = (local.hasFile ? local : readParams(source)).params;
+        if (!infobasePath.trim()) {
+          return { status: "missing", detail: "Добавьте тестовый профиль или задайте параметры учебной ИБ." };
+        }
+        return { status: "unchecked", detail: platformPath.trim() || platform.trim()
+          ? "Задана база проекта. Проверьте подключение и подтвердите, что база предназначена для тестов."
+          : "Задана база проекта. Выберите платформу и проверьте подключение." };
+      } catch {
+        return { status: "error", detail: "Не удалось прочитать настройки тестового профиля." };
+      }
+    },
     reviewHead({ path }) { return readReviewHead(path); },
     reviewEvidence({ path, change }) { return findReviewEvidence(path, change); },
     reviewFiles({ path, target }) { return verifyReviewSource(path, target); },
@@ -216,6 +246,9 @@ export default experimental_defineHostEntry({
     },
     bslFlowConfig({ path }) {
       return loadBslFlowConfig(path);
+    },
+    workflowEnabled({ path }) {
+      return readWorkflowEnabled(path);
     },
     saveBslFlowConfig({ path, revision, text }) {
       return saveBslFlowConfig(path, revision, text);

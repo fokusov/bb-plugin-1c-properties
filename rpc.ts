@@ -15,6 +15,7 @@ import {
   paramsSchema,
   platformSchema,
   projectStateSchema,
+  projectReadinessSchema,
   rlmStateSchema,
   sourceGitStateSchema,
   skillsStateSchema,
@@ -59,6 +60,10 @@ const checkResultSchema = z
   .strict();
 
 export const rpcContract = defineRpcContract({
+  projectReadiness: {
+    input: platformScopeSchema.extend({ probeUnica: z.boolean().optional() }),
+    output: projectReadinessSchema,
+  },
   platformProfiles: { input: platformScopeSchema, output: platformProfilesSchema },
   platformSaveProfile: {
     input: platformScopeSchema.extend({ profile: platformProfileSchema }),

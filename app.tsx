@@ -15,6 +15,7 @@ import { Input } from "@/components/ui/input";
 import { BslFlowSettings } from "@/components/bsl-flow-settings";
 import { PlatformOperationsPanel } from "./components/platform-operations.js";
 import { ReviewPanel } from "./components/review-panel.js";
+import { ProjectReadinessCard } from "./components/project-readiness.js";
 import { cn } from "@/lib/utils";
 
 interface StateResult {
@@ -185,7 +186,9 @@ function ProjectEditor({
   const [cleanLocks, setCleanLocks] = useState(false);
   const [updateDb, setUpdateDb] = useState(true);
   const [dynamic, setDynamic] = useState(true);
-  const [initNotice, setInitNotice] = useState<string | null>(null);
+  const [readinessRefresh, setReadinessRefresh] = useState(0);
+  const [preparationStage, setPreparationStage] = useState<string | null>(null);
+  const [preparationFailure, setPreparationFailure] = useState<string | null>(null);
   const [skillsNotice, setSkillsNotice] = useState<string | null>(null);
   const [rlmNotice, setRlmNotice] = useState<string | null>(null);
 
@@ -227,6 +230,7 @@ function ProjectEditor({
     run("save", async () => {
       const saved = await rpc.call("saveProject", { projectId: row.projectId, params: form });
       onSaved(saved);
+      setReadinessRefresh((value) => value + 1);
       setForm(saved.state.params);
       setCheck(null);
       setNotice("Параметры сохранены.");
@@ -236,6 +240,7 @@ function ProjectEditor({
     run("clear", async () => {
       const cleared = await rpc.call("clearProject", { projectId: row.projectId });
       onCleared(cleared);
+      setReadinessRefresh((value) => value + 1);
       setForm(cleared.state.params);
       setConfirmClear(false);
       setCheck(null);
@@ -273,32 +278,42 @@ function ProjectEditor({
 
   const initBslFlow = () =>
     run("bslflow", async () => {
-      const tools = await rpc.call("toolsEnsure", { projectId: row.projectId, update: true });
-      if (!tools.ok) throw new Error(tools.log.join("; ") || "не удалось установить инструменты");
-      const init = await rpc.call("initProject", { projectId: row.projectId });
-      onSaved(init.detail);
-      if (!init.ok) {
-        setInitNotice(null);
-        throw new Error(init.error || "BSL Flow bootstrap завершился с ошибкой");
+      const target = { projectId: row.projectId };
+      let stage = "Проверка проекта";
+      setPreparationFailure(null);
+      setPreparationStage(stage);
+      try {
+        const { files } = await rpc.call("projectReadiness", target);
+        if (!files.exists || !files.hasSources) throw new Error("Исходники 1С в каталоге проекта не обнаружены.");
+        if (files.schema && files.schema !== "bsl-flow") throw new Error("Несовместимая схема OpenSpec: " + files.schema);
+        if (files.flow.enabled === false) throw new Error("BSL Flow отключён для проекта.");
+        stage = "Подготовка BSL Flow Core";
+        setPreparationStage(stage);
+        const tools = await rpc.call("toolsEnsure", { ...target, update: true });
+        if (!tools.ok) throw new Error(tools.log.join("\n") || "Не удалось подготовить Core.");
+        stage = "Bootstrap проекта";
+        setPreparationStage(stage);
+        const init = await rpc.call("initProject", target);
+        onRefreshed(init.detail);
+        if (!init.ok) throw new Error(init.output || init.error || "Bootstrap завершился с ошибкой.");
+        stage = "Подключение скиллов";
+        setPreparationStage(stage);
+        const skills = await rpc.call("connectSkills", target);
+        onRefreshed(skills.detail);
+        if (!skills.ok) throw new Error(skills.error || "Не удалось подключить скиллы.");
+      } catch (cause) {
+        setPreparationFailure(stage + " · " + reportError(cause));
+      } finally {
+        setPreparationStage(null);
+        setReadinessRefresh((value) => value + 1);
       }
-      setInitNotice(
-        `BSL Flow инициализирован (создано ${init.created.length}, сохранено ${init.preserved.length}). ` +
-          `BSL Flow Core ${tools.state.bslflow.version || "—"}. ` +
-          "Заполни параметры базы ниже и нажми «Сохранить».",
-      );
-      const skills = await rpc.call("connectSkills", { projectId: row.projectId });
-      onSaved(skills.detail);
-      setSkillsNotice(
-        `Скиллы подключены: ${skills.copied.length} скопировано, ${skills.preserved.length} сохранено` +
-          `${skills.removed.length > 0 ? `, ${skills.removed.length} удалено` : ""}` +
-          `${skills.skipped.length > 0 ? `, ${skills.skipped.length} пропущено` : ""}.`,
-      );
     });
 
   const connectSkills = () =>
     run("skills", async () => {
       const result = await rpc.call("connectSkills", { projectId: row.projectId });
       onSaved(result.detail);
+      setReadinessRefresh((value) => value + 1);
       if (!result.ok) throw new Error(result.error || "не удалось подключить скиллы");
       setSkillsNotice(
         `Скиллы обновлены: ${result.copied.length} скопировано, ${result.preserved.length} сохранено` +
@@ -344,11 +359,19 @@ function ProjectEditor({
       {error === null ? null : <Notice kind="error">{error}</Notice>}
       {notice === null ? null : <Notice kind="ok">{notice}</Notice>}
 
+      <ProjectReadinessCard key={row.projectId} scope={{ projectId: row.projectId }}
+        refresh={readinessRefresh} prepare={initBslFlow} busy={busy !== null}
+        stage={preparationStage} failure={preparationFailure}
+        checkedConnection={check?.ok === true && JSON.stringify(form) === JSON.stringify(detail.state.params)} />
+
       <ToolsCard projectId={row.projectId} />
 
 
       <BslFlowSettings key={row.projectId} projectId={row.projectId} hostId={row.hostId} sourcePath={row.path} initialized={detail.state.bslflow.initialized}
-        onSaved={(enabled) => onSaved({ ...detail, state: { ...detail.state, bslflow: { ...detail.state.bslflow, enabled } } })} />
+        onSaved={(enabled) => {
+          onSaved({ ...detail, state: { ...detail.state, bslflow: { ...detail.state.bslflow, enabled } } });
+          setReadinessRefresh((value) => value + 1);
+        }} />
 
       <div className="rounded-md border border-border p-3">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -379,10 +402,6 @@ function ProjectEditor({
           </label>
         </div>
         <div className="mt-3 flex flex-wrap gap-2">
-          <Button size="sm" onClick={initBslFlow} disabled={busy !== null || detail.state.bslflow.enabled === false}>
-            <Icon name="FolderCog" className="size-4" />
-            {detail.state.bslflow.initialized ? "Обновить BSL Flow" : "Инициализировать BSL Flow"}
-          </Button>
           <Button size="sm" variant="outline" onClick={connectSkills} disabled={busy !== null}>
             <Icon name="Layers" className="size-4" />
             {detail.state.skills.total > 0 ? "Обновить скиллы" : "Подключить скиллы"}
@@ -404,7 +423,6 @@ function ProjectEditor({
           <code className="font-mono">.bb/skills</code>. rlm запускается на машине проекта и
           подхватывается автоматически при первом вызове <code className="font-mono">rlm_*</code>.
         </p>
-        {initNotice === null ? null : <div className="mt-2"><Notice kind="ok">{initNotice}</Notice></div>}
         {skillsNotice === null ? null : <div className="mt-2"><Notice kind="ok">{skillsNotice}</Notice></div>}
         {rlmNotice === null ? null : <div className="mt-2"><Notice kind="info">{rlmNotice}</Notice></div>}
         {detail.state.rlm.error === "" ? null : <div className="mt-2"><Notice kind="error">{detail.state.rlm.error}</Notice></div>}

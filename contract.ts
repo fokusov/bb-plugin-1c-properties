@@ -170,6 +170,35 @@ export const toolsStateSchema = z
 
 export const operationNameSchema = z.enum(["dump", "load", "extensions"]);
 
+const readinessStatus = z.object({
+  status: z.enum(["ready", "missing", "unchecked", "disabled", "error"]),
+  detail: z.string(),
+}).strict();
+
+export const readinessFilesSchema = z.object({
+  exists: z.boolean(),
+  hasSources: z.boolean(),
+  git: sourceGitStateSchema,
+  schema: z.string(),
+  openspecCli: z.boolean(),
+  flow: bslflowStateSchema,
+  skills: skillsStateSchema,
+  core: toolInfoSchema,
+  review: readinessStatus,
+}).strict();
+
+export const projectReadinessSchema = z.object({
+  projectPath: z.string(),
+  path: z.string(),
+  hostName: z.string(),
+  files: readinessFilesSchema,
+  editor: z.boolean(),
+  unica: readinessStatus,
+  testBase: readinessStatus,
+}).strict();
+
+export type ProjectReadiness = z.infer<typeof projectReadinessSchema>;
+
 export const jobSchema = z
   .object({
     state: z.enum(["idle", "running", "done", "failed", "cancelled"]),
@@ -234,6 +263,14 @@ export type ToolInfo = z.infer<typeof toolInfoSchema>;
 export type ToolsState = z.infer<typeof toolsStateSchema>;
 
 export const hostContract = defineRpcContract({
+  readinessFiles: {
+    input: z.object({ path: z.string() }).strict(),
+    output: readinessFilesSchema,
+  },
+  readinessTestBase: {
+    input: z.object({ path: z.string(), source: z.string(), platform: z.string() }).strict(),
+    output: readinessStatus,
+  },
   ...platformHostMethods,
   reviewHead: { input: z.object({ path: z.string().min(1) }), output: z.string() },
   reviewEvidence: { input: z.object({ path: z.string().min(1), change: reviewChangeId }), output: reviewContract.reviewEvidence.output },
@@ -331,6 +368,10 @@ export const hostContract = defineRpcContract({
   bslFlowConfig: {
     input: z.object({ path: z.string().min(1) }).strict(),
     output: bslFlowConfigSchema,
+  },
+  workflowEnabled: {
+    input: z.object({ path: z.string().min(1) }).strict(),
+    output: z.boolean().nullable(),
   },
   saveBslFlowConfig: {
     input: z.object({ path: z.string().min(1), ...bslFlowConfigEdit }).strict(),

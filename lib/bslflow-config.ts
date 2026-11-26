@@ -41,6 +41,39 @@ export function readWorkflowEnabled(projectPath: string) {
   return text === null ? null : enabled(parseConfig(text));
 }
 
+/** Configuration preflight only. Review execution and evidence are owned by Core. */
+export function reviewReadiness(projectPath: string) {
+  try {
+    const text = readFile(join(projectPath, "bsl-flow.yaml"), true);
+    if (text === null) return { status: "missing" as const, detail: "Сначала подготовьте проект." };
+    const doc = parseConfig(text);
+    const disabled = (value: unknown) => value === false || value === "false";
+    if (!enabled(doc) || disabled(doc.getIn(["review", "enabled"]))) {
+      return { status: "disabled" as const, detail: "Ревью отключено настройками проекта. Условия приёмки определяет BSL Flow." };
+    }
+    const provider = doc.getIn(["review", "reviewer", "provider"]) ?? "opencode";
+    const model = doc.getIn(["review", "reviewer", "model"]);
+    if (!["api", "opencode", "codex_exec", "claude_cli", "claude_subagent"].includes(String(provider))) {
+      return { status: "missing" as const, detail: "Укажите поддерживаемый маршрут в review.reviewer.provider." };
+    }
+    if (provider !== "claude_subagent" && (typeof model !== "string" || !model.trim())) {
+      return { status: "missing" as const, detail: "Укажите модель для задачи M в review.reviewer.model." };
+    }
+    if (provider === "api" && typeof model === "string") {
+      const projectModel = doc.getIn(["llm", "models", model, "model"]);
+      const profile = profileOptions();
+      if (!(typeof projectModel === "string" && projectModel.trim()) && !profile.models.includes(model)) {
+        return { status: "missing" as const, detail: "Профиль модели ревью не найден в llm.models или пользовательских настройках." };
+      }
+    }
+    return { status: "unchecked" as const, detail: disabled(doc.getIn(["review", "council", "enabled"]))
+      ? "Маршрут M задан, Council отключён. Выполнение M проверяется результатом ревью задачи."
+      : "Маршрут M задан. Доступность модели и Council подтверждаются результатом ревью задачи." };
+  } catch {
+    return { status: "missing" as const, detail: "Проверьте настройки bsl-flow.yaml на машине проекта." };
+  }
+}
+
 function validateProjectConfig(doc: ReturnType<typeof parseConfig>) {
   enabled(doc);
   visit(doc, {
