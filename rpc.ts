@@ -13,6 +13,7 @@ import {
   jobSchema,
   operationNameSchema,
   paramsSchema,
+  passportStructureSchema,
   platformSchema,
   projectStateSchema,
   projectReadinessSchema,
@@ -21,6 +22,19 @@ import {
   skillsStateSchema,
   toolsStateSchema,
 } from "./contract.js";
+
+const passportInput = z.object({ projectId: z.string().min(1), environmentId: z.string().min(1).optional() }).strict();
+const passportOutput = z.object({
+  sourceId: z.string().nullable(),
+  environmentId: z.string().nullable(),
+  hostId: z.string(),
+  snapshotAt: z.string(),
+  configurations: z.array(z.object({ root: z.string(), format: z.string(), name: z.string().nullable(), synonym: z.string().nullable(), version: z.string().nullable() }).strict()),
+  ambiguous: z.boolean(),
+  configComplete: z.boolean(),
+  configError: z.string().nullable(),
+  metrics: z.object({ complete: z.boolean(), trackedFiles: z.number().int(), trackedBytes: z.number().int(), byExtension: z.record(z.string(), z.number().int()), reason: z.string().nullable() }).strict(),
+}).strict();
 
 export const projectRowSchema = z
   .object({
@@ -91,18 +105,12 @@ export const rpcContract = defineRpcContract({
     output: z.object({ text: z.string() }).strict(),
   },
   passport: {
-    input: z.object({ projectId: z.string().min(1), environmentId: z.string().min(1).optional() }).strict(),
-    output: z.object({
-      sourceId: z.string().nullable(),
-      environmentId: z.string().nullable(),
-      hostId: z.string(),
-      snapshotAt: z.string(),
-      configurations: z.array(z.object({ root: z.string(), format: z.string(), name: z.string().nullable(), synonym: z.string().nullable(), version: z.string().nullable() }).strict()),
-      ambiguous: z.boolean(),
-      configComplete: z.boolean(),
-      configError: z.string().nullable(),
-      metrics: z.object({ complete: z.boolean(), trackedFiles: z.number().int(), trackedBytes: z.number().int(), byExtension: z.record(z.string(), z.number().int()), reason: z.string().nullable() }).strict(),
-    }).strict(),
+    input: passportInput,
+    output: passportOutput,
+  },
+  passportV2: {
+    input: passportInput,
+    output: passportOutput.extend({ structure: passportStructureSchema }),
   },
   editorAvailability: editorAvailabilityMethod,
   bslFlowConfig: {

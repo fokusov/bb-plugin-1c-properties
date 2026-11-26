@@ -86,6 +86,8 @@ const EXT_ICON = "folder";
 
 const DIRS = new Set([...COMMON_GROUPS, ...MAIN_GROUPS].map(([d]) => d));
 
+export const isMetadataGroup = (directory) => DIRS.has(directory) || directory === "Languages" || directory === "Interfaces";
+
 const GROUP_LABEL = new Map([...COMMON_GROUPS, ...MAIN_GROUPS].map(([dir, label]) => [dir, label]));
 function groupLabel(dir) {
   return dir === EXT_DIR ? EXT_LABEL : GROUP_LABEL.get(dir) || dir;

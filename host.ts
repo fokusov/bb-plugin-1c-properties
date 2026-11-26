@@ -201,8 +201,8 @@ export default experimental_defineHostEntry({
       }
       return { text: getRunner(context).platform.report(operationScope(input), input.id, input.name) };
     },
-    passport({ path }) {
-      return readPassport(canonical(path));
+    passport({ path, includeStructure }) {
+      return readPassport(canonical(path), includeStructure);
     },
     async editorRequest(input, context) {
       const { handleHostRequest } = await import("./editor/host-core.js");

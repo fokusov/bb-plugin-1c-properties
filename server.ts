@@ -561,6 +561,20 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
+  async function projectPassport({ projectId, environmentId }: { projectId: string; environmentId?: string }, includeStructure: boolean, signal?: AbortSignal) {
+    const { project, source } = await resolveProjectSource(projectId);
+    let { path, hostId } = source;
+    if (environmentId) {
+      const environment = await bb.sdk.environments.get({ environmentId });
+      if (environment.projectId !== project.id || environment.status !== "ready" || !environment.path) {
+        throw new Error("рабочая папка не принадлежит проекту или недоступна");
+      }
+      ({ path, hostId } = environment);
+    }
+    const snapshot = await host.call("passport", { path, includeStructure }, { hostId, signal });
+    return { ...snapshot, sourceId: environmentId ? null : source.id, environmentId: environmentId ?? null, hostId };
+  }
+
   bb.rpc.register(platformDashboardContract, {
     async platformDashboardV1(scope) {
       const { hostScope, hostId } = await operationTarget(scope);
@@ -664,21 +678,13 @@ export default async function plugin(bb: BbPluginApi) {
       };
     },
     async passport({ projectId, environmentId }, { experimental_signal: signal }) {
-      const project = await bb.sdk.projects.get({ projectId });
-      const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
-      if (!source) throw new Error(`у проекта «${project.name}» нет папки-источника`);
-      let path = source.path;
-      let hostId = source.hostId;
-      if (environmentId) {
-        const environment = await bb.sdk.environments.get({ environmentId });
-        if (environment.projectId !== project.id || environment.status !== "ready" || !environment.path) {
-          throw new Error("рабочая папка не принадлежит проекту или недоступна");
-        }
-        path = environment.path;
-        hostId = environment.hostId;
-      }
-      const passport = await host.call("passport", { path }, { hostId, signal });
-      return { ...passport, sourceId: environmentId ? null : source.id, environmentId: environmentId ?? null, hostId };
+      const { structure: _structure, ...snapshot } = await projectPassport({ projectId, environmentId }, false, signal);
+      return snapshot;
+    },
+    async passportV2(scope, { experimental_signal: signal }) {
+      const { structure, ...snapshot } = await projectPassport(scope, true, signal);
+      if (!structure) throw new Error("Расширенный паспорт рабочей копии не получен.");
+      return { ...snapshot, structure };
     },
     async bslFlowConfig({ projectId }, { experimental_signal: signal }) {
       const target = await resolveTarget(projectId);

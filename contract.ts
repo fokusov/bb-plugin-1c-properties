@@ -262,6 +262,13 @@ export type CleanupScan = z.infer<typeof cleanupScanSchema>;
 export type ToolInfo = z.infer<typeof toolInfoSchema>;
 export type ToolsState = z.infer<typeof toolsStateSchema>;
 
+export const passportStructureSchema = z.object({
+  bslModules: z.number().int().nonnegative(),
+  bslLines: z.number().int().nonnegative(),
+  objectsByRoot: z.record(z.string(), z.number().int().nonnegative()),
+  extensions: z.array(z.object({ root: z.string(), purpose: z.string() }).strict()),
+}).strict();
+
 export const hostContract = defineRpcContract({
   readinessFiles: {
     input: z.object({ path: z.string() }).strict(),
@@ -276,7 +283,7 @@ export const hostContract = defineRpcContract({
   reviewEvidence: { input: z.object({ path: z.string().min(1), change: reviewChangeId }), output: reviewContract.reviewEvidence.output },
   reviewFiles: { input: z.object({ path: z.string().min(1), target: reviewTarget }), output: z.array(z.string()) },
   passport: {
-    input: z.object({ path: z.string().min(1) }).strict(),
+    input: z.object({ path: z.string().min(1), includeStructure: z.boolean().optional() }).strict(),
     output: z.object({
       snapshotAt: z.string(),
       configurations: z.array(z.object({ root: z.string(), format: z.string(), name: z.string().nullable(), synonym: z.string().nullable(), version: z.string().nullable() }).strict()),
@@ -284,6 +291,7 @@ export const hostContract = defineRpcContract({
       configComplete: z.boolean(),
       configError: z.string().nullable(),
       metrics: z.object({ complete: z.boolean(), trackedFiles: z.number().int(), trackedBytes: z.number().int(), byExtension: z.record(z.string(), z.number().int()), reason: z.string().nullable() }).strict(),
+      structure: passportStructureSchema.optional(),
     }).strict(),
   },
   editorRequest: editorHostMethod,
