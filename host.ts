@@ -10,8 +10,11 @@ import { detectPlatforms, listInfoBases } from "./lib/infobases.js";
 import { OperationRunner } from "./lib/operations.js";
 import { PlatformOperations } from "./lib/platform-operations.js";
 import { DiagnosticReports, diagnosticArtifact } from "./lib/diagnostic-reports.js";
-import { physicalPath, planPlatformOperation, readPlatformProfiles, savePlatformProfile } from "./lib/platform-plan.js";
-import type { PlatformRequest } from "./platform-contract.js";
+import { readPlatformInventory } from "./lib/platform-inventory.js";
+import { physicalPath, planEdtOperation, planPlatformOperation, readPlatformProfiles, savePlatformProfile } from "./lib/platform-plan.js";
+import { isEdtAction, type PlatformRequest } from "./platform-contract.js";
+import { findEdtCli, platformTools, readCluster } from "./lib/platform-tools.js";
+import { hashPlatformFile, inspectCfuPlan } from "./lib/platform-cfu.js";
 import {
   clearParams,
   detectProject,
@@ -60,9 +63,22 @@ function diagnosticReports(context: ExperimentalHostRpcContext): DiagnosticRepor
   return new DiagnosticReports(join(context.experimental_paths.dataDir, "diagnostic-reports-v1"));
 }
 
+function operationParams(path: string, source: string) {
+  const local = readParams(path);
+  return (local.hasFile ? local : readParams(source)).params;
+}
+
 function resolvePlatformPlan(input: { path: string; source: string; fallback: string; request: PlatformRequest }, runner: PlatformOperations) {
-  const local = readParams(input.path);
-  const params = (local.hasFile ? local : readParams(input.source)).params;
+  if (isEdtAction(input.request.action)) {
+    const edt = findEdtCli();
+    if (!edt) throw new Error("На выбранном хосте не найден EDT CLI. Проверь установку в разделе «Инструменты хоста».");
+    return {
+      plan: planEdtOperation(input.path, input.request, edt),
+      secrets: { passwordSecret: undefined, unlockCodeSecret: undefined },
+      user: "", legacyAuth: null,
+    };
+  }
+  const params = operationParams(input.path, input.source);
   const profile = input.request.profile === "project"
     ? { name: "project" as const, kind: "project" as const, infobase: params.infobasePath, platform: params.platformPath, user: params.user }
     : readPlatformProfiles(input.source).find(({ name }) => name === input.request.profile);
@@ -77,6 +93,16 @@ function resolvePlatformPlan(input: { path: string; source: string; fallback: st
     user: profile.user ?? "",
     legacyAuth: saved === null ? params : null,
   };
+}
+
+function platformAuth(resolved: ReturnType<typeof resolvePlatformPlan>, input: {
+  password: string; unlockCode: string; secretNames: { passwordSecret?: string; unlockCodeSecret?: string };
+}) {
+  const { secrets, user, legacyAuth } = resolved;
+  if (secrets.passwordSecret !== input.secretNames.passwordSecret || secrets.unlockCodeSecret !== input.secretNames.unlockCodeSecret) {
+    throw new Error("Ссылки на секреты изменились. Обнови предпросмотр операции.");
+  }
+  return { user, password: legacyAuth?.password ?? input.password, unlockCode: legacyAuth?.unlockCode ?? input.unlockCode };
 }
 
 function getRlm(context: ExperimentalHostRpcContext): RlmRunner {
@@ -157,24 +183,30 @@ export default experimental_defineHostEntry({
     platformSaveProfile({ path, profile }) {
       return savePlatformProfile(path, profile);
     },
-    platformPreview(input, context) {
+    async platformPreview(input, context) {
       const { plan, secrets } = resolvePlatformPlan(input, getRunner(context).platform);
+      if (plan.preview.sourceSha256 && await hashPlatformFile(plan.preview.input!, context.signal) !== plan.preview.sourceSha256) {
+        throw new Error("SHA-256 копии DT не совпадает с ожидаемым.");
+      }
       return { preview: plan.preview, secrets };
     },
-    platformStart(input, context) {
+    platformCfuPreview(input, context) {
+      const resolved = resolvePlatformPlan(input, getRunner(context).platform);
+      return inspectCfuPlan(resolved.plan, platformAuth(resolved, input), context.signal);
+    },
+    async platformStart(input, context) {
       const runner = getRunner(context);
       if (runner.legacyRunning) throw new Error("На хосте уже выполняется операция 1С.");
-      const { plan, secrets, user, legacyAuth } = resolvePlatformPlan(input, runner.platform);
-      if (secrets.passwordSecret !== input.secretNames.passwordSecret || secrets.unlockCodeSecret !== input.secretNames.unlockCodeSecret) {
-        throw new Error("Ссылки на секреты изменились. Обнови предпросмотр операции.");
+      const resolved = resolvePlatformPlan(input, runner.platform);
+      const { plan } = resolved;
+      const auth = platformAuth(resolved, input);
+      if (plan.preview.action === "apply-cfu") {
+        await inspectCfuPlan(plan, auth, context.signal);
+        if (runner.legacyRunning) throw new Error("На хосте уже выполняется операция 1С.");
       }
       const lease = context.experimental_retainWorker();
       try {
-        return runner.platform.start(operationScope(input), plan, {
-          user,
-          password: legacyAuth?.password ?? input.password,
-          unlockCode: legacyAuth?.unlockCode ?? input.unlockCode,
-        }, input.confirmation, input.inspected, lease);
+        return runner.platform.start(operationScope(input), plan, auth, input.confirmation, input.inspected, lease);
       } catch (error) {
         lease.dispose();
         throw error;
@@ -182,6 +214,17 @@ export default experimental_defineHostEntry({
     },
     platformJournal(input, context) {
       return getRunner(context).platform.list(operationScope(input));
+    },
+    platformInventory({ path }, { signal }) {
+      return readPlatformInventory(path, signal);
+    },
+    platformTools({ path, source, fallback }) {
+      return platformTools(operationParams(path, source).platformPath || fallback);
+    },
+    platformCluster({ path, source, fallback, query }, { signal }) {
+      const rac = platformTools(operationParams(path, source).platformPath || fallback).rac;
+      if (!rac) throw new Error("На выбранном хосте не найдена утилита rac.");
+      return readCluster(rac, query, signal);
     },
     diagnosticReports(input, context) {
       return diagnosticReports(context).list(operationScope(input));

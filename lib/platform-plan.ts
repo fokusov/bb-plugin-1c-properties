@@ -9,16 +9,18 @@ import {
   type PlatformRequest,
 } from "../platform-contract.js";
 import { resolveBase, resolvePlatform } from "./designer.js";
-import { writeJson } from "./platform-journal.js";
+import { readBoundedText, writeJson } from "./platform-journal.js";
 
 const profilesSchema = z.object({ profiles: z.array(platformProfileSchema).max(50) }).strict();
 const mutations = new Set<PlatformRequest["action"]>([
   "load-xml", "load-binary", "build-configuration", "unpack-configuration",
   "create-file-base", "restore-dt", "update-db", "open-enterprise", "yaxunit", "vanessa",
+  "apply-cfu",
 ]);
 const fileOnly = new Set<PlatformRequest["action"]>([
   "build-configuration", "unpack-configuration", "create-file-base",
   "dump-dt", "restore-dt", "update-db", "yaxunit", "vanessa",
+  "build-distribution", "build-cfu", "apply-cfu",
 ]);
 
 export function readPlatformProfiles(path: string): PlatformProfile[] {
@@ -79,9 +81,14 @@ function mustExist(path: string, directory: boolean): void {
   }
 }
 
-function stamp(path: string): string {
+export function platformFileStamp(path: string): string {
   const stat = statSync(path, { bigint: true, throwIfNoEntry: false });
   return stat ? [stat.dev, stat.ino, stat.size, stat.mtimeNs].join(":") : "";
+}
+
+export function assertStandaloneFileBase(path: string): void {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.nlink !== 1) throw new Error("Файл 1Cv8.1CD должен быть отдельным файлом без ссылок.");
 }
 
 export function inspectTarget(baseArg: string): string {
@@ -103,6 +110,11 @@ export function planPlatformOperation(input: {
   recovery: string | null;
 }) {
   const { action, extension, format, profile } = input.request;
+  if (input.request.baseProject) throw new Error("Базовый проект используется только для EDT.");
+  if (!["apply-cfu", "restore-dt"].includes(action) && input.request.sha256) {
+    throw new Error("SHA-256 используется для применения CFU и проверки копии DT.");
+  }
+  if (action === "apply-cfu" && !input.request.sha256) throw new Error("Укажи доверенный SHA-256 файла CFU.");
   const workspace = physicalPath(resolve(input.path));
   mustExist(workspace, true);
   const requestedPlatform = input.profile.platform || input.fallback;
@@ -121,7 +133,7 @@ export function planPlatformOperation(input: {
   if ("error" in raw) throw new Error("Укажи FILE-каталог или строку соединения Srvr/Ref.");
   const fileBase = raw.arg.startsWith("/F");
   if (!fileBase && fileOnly.has(action)) throw new Error("Для этой операции требуется FILE-база.");
-  if (fileOnly.has(action) && ["yaxunit", "vanessa", "restore-dt"].includes(action) && input.profile.kind !== "test") {
+  if (["yaxunit", "vanessa", "restore-dt", "apply-cfu"].includes(action) && input.profile.kind !== "test") {
     throw new Error("Для этой операции выбери именованный test-профиль.");
   }
   const target = fileBase ? workspacePath(workspace, raw.arg.slice(2)) : raw.arg.slice(2);
@@ -132,6 +144,7 @@ export function planPlatformOperation(input: {
     if (existsSync(target)) throw new Error(`Для создания базы нужен новый каталог: ${target}`);
     mustExist(dirname(target), true);
   } else if (baseFile) mustExist(baseFile, false);
+  if (baseFile && (action === "apply-cfu" || (action === "restore-dt" && input.request.sha256))) assertStandaloneFileBase(baseFile);
 
   const source = input.request.input ? workspacePath(workspace, input.request.input) : null;
   const output = input.request.output ? workspacePath(workspace, input.request.output) : null;
@@ -140,7 +153,7 @@ export function planPlatformOperation(input: {
   const designer = (...args: string[]) => stages.push({ mode: "DESIGNER", args, verdict: "platform" });
   const tag = extension ? ["-Extension", extension] : [];
   const xmlFormat = ["-Format", format];
-  const usesExtension = ["dump-xml", "load-xml", "dump-binary", "load-binary", "build-configuration", "unpack-configuration", "update-db", "check-syntax"].includes(action);
+  const usesExtension = ["dump-xml", "load-xml", "dump-binary", "load-binary", "build-configuration", "unpack-configuration", "update-db", "check-syntax", "check-config"].includes(action);
   if (extension && !usesExtension) throw new Error("Эта операция не использует имя расширения.");
   const usesConfig = action === "yaxunit" || action === "vanessa";
   if (config && !usesConfig) throw new Error("Эта операция не использует файл настроек запуска.");
@@ -185,8 +198,20 @@ export function planPlatformOperation(input: {
     case "open-designer": stages.push({ mode: "DESIGNER", args: [], verdict: "launch" }); break;
     case "dump-dt": designer("/DumpIB", write(".dt")); break;
     case "restore-dt": designer("/RestoreIB", read(".dt")); break;
+    case "build-distribution": designer("/CreateDistributionFiles", "-cffile", write(".cf"), "-WarningAsError"); break;
+    case "build-cfu": designer("/CreateDistributionFiles", "-cfufile", write(".cfu"), "-f", read(".cf"), "-WarningAsError"); break;
+    case "apply-cfu":
+      read(".cfu");
+      write(".dt");
+      designer("/DumpCfg");
+      designer("/DumpDBCfg");
+      designer("/DumpIB");
+      designer("/UpdateCfg");
+      designer("/UpdateDBCfg", "-WarningsAsErrors");
+      break;
     case "update-db": designer("/UpdateDBCfg", ...tag); break;
     case "check-syntax": designer("/CheckModules", "-ThinClient", "-Server", "-ExternalConnection", ...tag); break;
+    case "check-config": designer("/CheckConfig", "-ConfigLogIntegrity", "-IncorrectReferences", ...tag); break;
     case "yaxunit": stages.push({ mode: "ENTERPRISE", args: [], verdict: "junit" }); break;
     case "vanessa": stages.push({ mode: "ENTERPRISE", args: ["/TestManager", "/Execute", read(".epf")], verdict: "junit" }); break;
   }
@@ -198,13 +223,85 @@ export function planPlatformOperation(input: {
   const preview: PlatformPreview = {
     action, profile, kind: input.profile.kind, workspace, target, platform: platform.exe, input: source, output,
     extension: extension ?? null, config, format, confirmation: null, recovery: input.recovery, targetState: inspectTarget(baseArg),
+    ...(action === "restore-dt" && input.request.sha256 ? { sourceSha256: input.request.sha256 } : {}),
   };
+  const baseStamp = baseFile ? platformFileStamp(baseFile) : null;
   if (mutations.has(action)) {
     preview.confirmation = createHash("sha256").update(JSON.stringify([
-      preview, input.profile, stamp(platform.exe), baseFile && stamp(baseFile), source && stamp(source), config && stamp(config),
+      preview, input.profile, platformFileStamp(platform.exe), baseStamp, source && platformFileStamp(source), config && platformFileStamp(config),
+      ...(input.request.sha256 ? [input.request.sha256] : []),
     ])).digest("hex");
   }
-  return { preview, platform, baseArg, stages, mutation: mutations.has(action), baseFile };
+  const cfu = action === "apply-cfu" ? { sha256: input.request.sha256!, baseStamp: baseStamp! } : null;
+  const restoreSha256 = action === "restore-dt" ? input.request.sha256 ?? null : null;
+  return { preview, platform, baseArg, stages, mutation: mutations.has(action), baseFile, baseStamp, cfu, restoreSha256 };
 }
 
-export type PlatformPlan = ReturnType<typeof planPlatformOperation>;
+const edtDescriptor = ["src", "Configuration", "Configuration.mdo"];
+
+export function edtResultDescriptor(action: PlatformRequest["action"], root: string): string {
+  return action === "edt-import" ? join(root, ...edtDescriptor) : join(root, "Configuration.xml");
+}
+
+export function edtTargetState(output: string): string {
+  return existsSync(output) ? "Выходной каталог существует." : "Будет создан новый выходной каталог.";
+}
+
+function edtProject(path: string) {
+  mustExist(path, true);
+  const file = (name: string) => {
+    const physical = physicalPath(join(path, name));
+    if (!contains(path, physical)) throw new Error("Дескриптор EDT расположен за пределами проекта.");
+    mustExist(physical, false);
+    return readBoundedText(physical, 128 * 1024);
+  };
+  const description = file(".project");
+  const name = /<name>\s*([^<>]+?)\s*<\/name>/.exec(description)?.[1];
+  const manifest = file(join("DT-INF", "PROJECT.PMF"));
+  const version = /^Runtime-Version:\s*(\d+\.\d+\.\d+(?:\.\d+)?)\s*$/m.exec(manifest)?.[1];
+  const baseName = /^Base-Project:[ \t]*(\S[^\r\n]*?)\s*$/m.exec(manifest)?.[1];
+  if (!name) throw new Error("В .project отсутствует имя проекта EDT.");
+  return { name, version, baseName };
+}
+
+export function planEdtOperation(path: string, request: PlatformRequest, executable: string) {
+  const { action, input, output, baseProject, format } = request;
+  if (action !== "edt-import" && action !== "edt-export") throw new Error("Неизвестная операция EDT.");
+  if (request.profile !== "project" || request.config || request.extension || request.sha256 || format !== "Hierarchical") {
+    throw new Error("Для EDT выбери вход, выход и при необходимости базовый проект EDT.");
+  }
+  if (!input || !output) throw new Error("Укажи вход и новый выходной каталог EDT.");
+  const workspace = physicalPath(resolve(path));
+  mustExist(workspace, true);
+  const source = workspacePath(workspace, input);
+  const destination = workspacePath(workspace, output);
+  const base = baseProject ? workspacePath(workspace, baseProject) : null;
+  mustExist(source, true);
+  if (existsSync(destination)) throw new Error(`Путь выхода уже существует: ${destination}`);
+  if (contains(source, destination) || (base && contains(base, destination))) {
+    throw new Error("Выход операции не должен попадать во входной каталог.");
+  }
+  const isImport = action === "edt-import";
+  const descriptor = physicalPath(join(source, ...(isImport ? ["Configuration.xml"] : edtDescriptor)));
+  if (!contains(source, descriptor)) throw new Error("Дескриптор расположен за пределами входного каталога.");
+  mustExist(descriptor, false);
+  const sourceProject = isImport ? null : edtProject(source);
+  const isExtension = sourceProject ? Boolean(sourceProject.baseName)
+    : /<(?:\w+:)?ConfigurationExtensionPurpose>\s*[^\s<]/i.test(readBoundedText(descriptor, 16 * 1024 * 1024));
+  if (isExtension && !base) throw new Error("Укажи каталог базового проекта EDT для расширения.");
+  if (!isExtension && base) throw new Error("Базовый проект EDT нужен только для расширения.");
+  const project = base ? edtProject(base) : null;
+  if (project && (project.baseName || !project.version)) throw new Error("Базовый проект EDT должен быть конфигурацией с заданной версией платформы.");
+  if (project && sourceProject && (project.name !== sourceProject.baseName || project.version !== sourceProject.version)) {
+    throw new Error("Имя и версия платформы базового проекта EDT должны совпадать с манифестом расширения.");
+  }
+  const preview: PlatformPreview = {
+    action, profile: "project", kind: "project", workspace, target: destination, platform: executable,
+    input: source, output: destination, extension: null, config: null, format, confirmation: null, recovery: null,
+    targetState: edtTargetState(destination), ...(base ? { baseProject: base } : {}),
+  };
+  return { preview, baseArg: null, mutation: false, source, destination, base, baseName: project?.name, version: project?.version };
+}
+
+export type EdtPlan = ReturnType<typeof planEdtOperation>;
+export type PlatformPlan = ReturnType<typeof planPlatformOperation> | EdtPlan;

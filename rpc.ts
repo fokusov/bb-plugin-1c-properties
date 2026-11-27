@@ -1,7 +1,7 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { editorAvailabilityMethod } from "./editor/contract.js";
-import { platformArtifactNameSchema, platformJournalEntrySchema, platformPreviewSchema, platformProfileSchema, platformProfilesSchema, platformRequestSchema, platformRunIdSchema, platformRunOptions, platformScopeSchema } from "./platform-contract.js";
+import { platformArtifactNameSchema, platformClusterRequestSchema, platformClusterSchema, platformInventorySchema, platformJournalEntrySchema, platformPreviewSchema, platformProfileSchema, platformProfilesSchema, platformRequestSchema, platformRunIdSchema, platformRunOptions, platformScopeSchema, platformToolsSchema } from "./platform-contract.js";
 import {
   bslflowStateSchema,
   bslFlowConfigEdit,
@@ -100,6 +100,12 @@ export const rpcContract = defineRpcContract({
     input: platformScopeSchema.extend({ id: platformRunIdSchema }),
     output: platformJournalEntrySchema.nullable(),
   },
+  platformInventory: {
+    input: platformScopeSchema,
+    output: platformInventorySchema.extend({ hostId: z.string() }),
+  },
+  platformTools: { input: platformScopeSchema, output: platformToolsSchema.extend({ hostId: z.string() }) },
+  platformCluster: { input: platformScopeSchema.extend({ query: platformClusterRequestSchema }), output: platformClusterSchema },
   platformArtifact: {
     input: platformScopeSchema.extend({ id: platformRunIdSchema, name: platformArtifactNameSchema }),
     output: z.object({ text: z.string() }).strict(),

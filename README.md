@@ -32,6 +32,9 @@ BSL Flow, а `rlm-tools-bsl` подключён как native-инструмен
 - Операции платформы из панели проекта, вкладки «1С» и CLI. Именованные
   dev/test-профили, сборка и разбор артефактов, FILE-базы и DT, синтаксис,
   YAxUnit и Vanessa Automation. Журнал привязан к рабочей копии.
+  Дерево поддерживает импорт и экспорт EDT, поставку CF и обновление CFU
+  с проверкой SHA-256 и резервной копией. В разделе инструментов хоста
+  доступны обнаружение утилит и просмотр кластеров и сеансов через RAS.
   [Документация операций и отчётов](docs/platform-operations.md)
 - Агентный инструмент `project_1c_params` и CLI `bb 1c-properties` для тех же
   данных и операций.
@@ -67,7 +70,7 @@ lease-ом, пока идёт дочерний процесс; при выгру
 ## Установка
 
 ```powershell
-bb plugin install git:https://github.com/fokusov/bb-plugin-1c-properties.git@v0.1.0
+bb plugin install git:https://github.com/fokusov/bb-plugin-1c-properties.git@v0.1.3
 ```
 
 Для разработки из локальной копии выполните `npm ci` и `bb plugin install .`. После правок выполните `bb plugin build .` и `bb plugin reload 1c-properties`.

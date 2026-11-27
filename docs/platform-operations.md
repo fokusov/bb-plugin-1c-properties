@@ -41,6 +41,7 @@ bb 1c-properties platform artifact <id> --artifact operation.log
 ## Проверки и BB Workflows
 
 - `check-syntax` использует `/CheckModules` для тонкого клиента, сервера и внешнего соединения. Через `--extension` можно выбрать расширение. Отчёт `operation.log` публикуется и при ошибке синтаксиса.
+- `check-config` проверяет логическую целостность и ссылки конфигурации или расширения с помощью `/CheckConfig`. Журнал доступен как `operation.log`.
 - `yaxunit` запускает установленное в тестовой базе расширение YAxUnit через `RunUnitTests`. Параметр `--config` принимает JSON настроек, например фильтр по модулям. Плагин задаёт выход JUnit и завершение сеанса после тестов.
 - `vanessa` принимает `--input <vanessa-automation-single.epf>` и `--config <VAParams.json>`. Плагин задаёт вывод JUnit и завершение сеанса после сценариев. Подготовка клиента тестирования и сценарии задаются в VAParams.
 
@@ -73,6 +74,67 @@ bb 1c-properties platform import-diagnostics apk <projectId> --environment <envi
 ### Паспорт исходников
 
 `passportV2` принимает `projectId` и необязательный `environmentId`, как `passport`. К базовому паспорту добавляется `structure`: число отслеживаемых модулей и физических строк BSL, количество дескрипторов объектов верхнего уровня по корням XML/EDT, корни и назначение обнаруженных расширений. Счётчики читают рабочую копию, включая правки в отслеживаемых файлах. Поля `configComplete` и `metrics.complete` сообщают об ограничениях. `passport` сохраняет прежнюю форму ответа.
+
+### Дерево операций
+
+Раскройте «Операции» во вкладке «1С» или в карточке проекта. Поиск работает по командам, узлам файлов, профилям и запускам. Звезда добавляет команду в избранное браузера. При выборе CF, CFE, EPF, ERF, DT или исходника XML в деталях появляются применимые действия. Выбранный файл подставляется в форму как относительный путь. Предпросмотр показывает абсолютную цель перед запуском.
+
+Список артефактов ограничен 400 узлами, 24 000 просмотренными записями, 1 000 заголовками XML внешних файлов и семью уровнями вложенности. Дерево помечает неполный результат. Вложенные FILE-базы, ссылки, служебные каталоги и зависимости исключаются. Кнопка обновления перечитывает список, профили и журнал.
+
+### EDT
+
+В ветке «EDT» выберите «Импортировать XML в EDT» или «Экспортировать EDT в XML». Выбор артефакта XML или EDT в дереве заполняет вход. Для импорта укажите каталог с `Configuration.xml`, для экспорта — корень EDT-проекта с `.project` и `src/Configuration/Configuration.mdo`. Выходной каталог должен быть новым. Операции работают с исходниками и не требуют профиля базы.
+
+```powershell
+bb 1c-properties platform preview edt-import <projectId> --environment <environmentId> --input "src XML" --output "build/EDT project"
+bb 1c-properties platform run edt-import <projectId> --environment <environmentId> --input "src XML" --output "build/EDT project" --json
+bb 1c-properties platform run edt-export <projectId> --environment <environmentId> --input "build/EDT project" --output "build/XML files" --json
+```
+
+Для расширения в форме укажите каталог базового EDT-проекта. В CLI передайте его через `--base-project`. Импорт использует версию платформы базового проекта, экспорт сверяет имя и версию с манифестом расширения. Рабочая область EDT создаётся на время операции. При наличии зависимостей каждая команда выполняется отдельным процессом. Результат содержит выходной дескриптор и `operation.log`. После сбоя используйте новый каталог после проверки оставшихся файлов.
+
+### Инструменты и RAS
+
+«Инструменты хоста» показывает найденные OneScript, OPM, EDT CLI, `rac` и `ibsrv`. Поиск использует PATH, стандартные каталоги установщиков на Windows и каталоги установленных версий платформы. «Кластеры и сеансы» принимает адрес RAS в формате `хост[:порт]`. Нажмите «Показать кластеры» и выберите нужный кластер. Подключение и вызовы выполняются с хоста выбранного окружения. Для RAS используется доступ, уже предоставленный выбранному хосту. Подключения с обязательным вводом учётных данных возвращают сообщение RAS.
+
+```powershell
+bb 1c-properties platform tools <projectId> --environment <environmentId> --json
+bb 1c-properties platform clusters <projectId> --environment <environmentId> --ras 127.0.0.1:1545 --json
+bb 1c-properties platform sessions <projectId> --environment <environmentId> --ras 127.0.0.1:1545 --cluster <uuid> --json
+```
+
+### Поставка и поддержка CFU
+
+В ветке «Поставка и поддержка» создайте CF поставщика из базы выпуска, затем CFU из базы следующей версии. Обе базы должны иметь сохранённую и обновлённую конфигурацию БД. Для сборки CFU выберите предыдущий **файл поставки** CF. Плагин записывает SHA-256 готового файла в журнал. Выходы должны быть новыми.
+
+```powershell
+bb 1c-properties platform run build-distribution <projectId> --thread <threadId> --profile vendor-v1 --output "out/Release 1.cf" --json
+bb 1c-properties platform run build-cfu <projectId> --thread <threadId> --profile vendor-v2 --input "out/Release 1.cf" --output "out/Update 2.cfu" --json
+```
+
+Для применения используйте простаивающую выделенную FILE-базу с именованным профилем `test`. На Windows нужен зарегистрированный COMConnector той же версии, что и выбранная платформа. Введите SHA-256 из доверенного журнала сборки или независимо полученного значения поставщика. В предпросмотре сверьте имя конфигурации, поставщика, версии, полный путь базы и новый путь копии DT.
+
+```powershell
+bb 1c-properties platform preview apply-cfu <projectId> --thread <threadId> --profile qa --input "out/Update 2.cfu" --output "backups/Before update.dt" --sha256 <CFU_SHA256> --json
+bb 1c-properties platform run apply-cfu <projectId> --thread <threadId> --profile qa --input "out/Update 2.cfu" --output "backups/Before update.dt" --sha256 <CFU_SHA256> --confirm <CODE_FROM_PREVIEW> --json
+```
+
+Запуск проверяет синхронизацию основной конфигурации с конфигурацией БД на снимке FILE. До применения он сохраняет DT и сверяет SHA-256 опубликованной копии. После `/UpdateCfg` и `/UpdateDBCfg` сверяет фактическую версию конфигурации БД. Приложение обновляется на уровне конфигурации. Прикладные миграции и тесты запускаются отдельными шагами проекта.
+
+Для восстановления выберите созданную копию DT и тот же профиль. Скопируйте SHA-256 из артефакта запуска CFU. После частичного сбоя проверьте фактическое состояние базы и передайте идентификатор сбоя через `--inspected`.
+
+```powershell
+bb 1c-properties platform preview restore-dt <projectId> --thread <threadId> --profile qa --input "backups/Before update.dt" --sha256 <DT_SHA256> --json
+bb 1c-properties platform run restore-dt <projectId> --thread <threadId> --profile qa --input "backups/Before update.dt" --sha256 <DT_SHA256> --confirm <CODE_FROM_PREVIEW> --json
+```
+
+### Локальный автономный сервер и учебные данные
+
+Для локальной отладки подготовьте выделенную FILE-базу из синтетического DT с известным происхождением и SHA-256. Штатный `ibcmd infobase create --restore` позволяет восстановить её в новый каталог. Проверьте метаданные и ожидаемые контрольные данные. Для параметризованного наполнения храните версию набора и признак успешного выполнения. Перед повтором сверяйте состояние записей.
+
+Запускайте `ibsrv` установленной версии платформы на хосте базы с явными именем ИБ, путём FILE и отдельным каталогом данных сервера. Ограничивайте HTTP и мониторинг loopback, отключайте SSH, прямой шлюз и регламентные задания. Плагин обнаруживает `ibsrv` в «Инструментах хоста», запуск выполняется нативным CLI. [Руководство по автономному серверу](https://kb.1ci.com/1C_Enterprise_Platform/Guides/Administrator_Guides/1C_Enterprise_8.3.23_Administrator_Guide/7._Standalone_server/7.1._General_information/?language=en)
+
+В BB Workflows успешный этап может быть переиспользован при продолжении. После остановки сверяйте статус нативной операции и её журнал перед повтором команды. Внешнюю EPF или ERF запускайте отдельно на подтверждённой тестовой базе после проверки происхождения, SHA-256 и параметров. Для исполнения используйте безопасный режим и ограничивайте права и доступ к сети. [BB Workflows](https://getbb.app/marketplace/workflows) · [Стандарт 1С по внешнему коду](https://kb.1ci.com/1C_Enterprise_Platform/Guides/Developer_Guides/1C_Enterprise_Development_Standards/General_security_issues/Restrictions_on_external_developments/?language=en)
 
 ### Импорт диагностики для дашборда
 

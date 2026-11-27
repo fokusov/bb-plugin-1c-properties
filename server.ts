@@ -26,7 +26,7 @@ import { WORKFLOW_DISABLED } from "./lib/bslflow-fields.js";
 import { shouldExposeRlmTools } from "./lib/agent-tools.js";
 import { registerReview } from "./lib/review-server.js";
 import {
-  diagnosticImportSchema, platformActions, platformArtifactNameSchema, platformDashboardContract, platformProfileSchema, platformRequestSchema,
+  diagnosticImportSchema, isEdtAction, platformActions, platformArtifactNameSchema, platformClusterRequestSchema, platformDashboardContract, platformProfileSchema, platformRequestSchema,
   platformRunIdSchema, platformRunOptions, platformScopeSchema,
   type PlatformJournalEntry,
   type PlatformPreview, type PlatformRequest, type PlatformScope,
@@ -510,35 +510,53 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  async function platformCredentials(secrets: { passwordSecret?: string; unlockCodeSecret?: string }, scope: PlatformScope, signal?: AbortSignal) {
+    const [password, unlockCode] = await Promise.all([
+      catalogSecret(secrets.passwordSecret, scope, signal),
+      catalogSecret(secrets.unlockCodeSecret, scope, signal),
+    ]);
+    return { password, unlockCode, secretNames: secrets };
+  }
+
+  async function previewPlatform(scope: PlatformScope, request: PlatformRequest, signal?: AbortSignal) {
+    const { parameters, hostId, preview, secrets } = await preparePlatform(scope, request, signal);
+    if (request.action !== "apply-cfu") return preview;
+    const credentials = await platformCredentials(secrets, scope, signal);
+    return host.call("platformCfuPreview", { ...parameters, ...credentials }, { hostId, signal });
+  }
+
   async function startPlatform(scope: PlatformScope, request: PlatformRequest, confirmation?: string, inspected?: string, signal?: AbortSignal) {
     const { parameters, hostId, preview, secrets } = await preparePlatform(scope, request, signal);
-    if (preview.confirmation && preview.confirmation !== confirmation) {
+    if (preview.confirmation && (!confirmation || (request.action !== "apply-cfu" && preview.confirmation !== confirmation))) {
       throw new Error("Подтверди действие, адрес базы и платформу по актуальному предпросмотру.");
     }
     if (preview.confirmation && preview.recovery && preview.recovery !== inspected) {
       throw new Error(`Подтверди проверку фактического состояния результата ${preview.recovery}.`);
     }
-    const [password, unlockCode] = await Promise.all([
-      catalogSecret(secrets.passwordSecret, scope, signal),
-      catalogSecret(secrets.unlockCodeSecret, scope, signal),
-    ]);
+    const credentials = await platformCredentials(secrets, scope, signal);
     const entry = await host.call("platformStart", {
       ...parameters, ...(confirmation ? { confirmation } : {}), ...(inspected ? { inspected } : {}),
-      password, unlockCode, secretNames: secrets,
+      ...credentials,
     }, { hostId, signal });
     bb.realtime.publish("platform-operations", { projectId: scope.projectId });
     return entry;
   }
 
   function formatPreview(preview: PlatformPreview): string {
+    const edt = isEdtAction(preview.action);
     return [
       platformActions[preview.action],
       `Рабочая копия: ${preview.workspace}`,
-      `Профиль: ${preview.profile} (${preview.kind})`,
-      `Платформа: ${preview.platform}`,
-      `База: ${preview.target}`,
+      !edt && `Профиль: ${preview.profile} (${preview.kind})`,
+      edt ? `EDT CLI: ${preview.platform}` : `Платформа: ${preview.platform}`,
+      !edt && `База: ${preview.target}`,
       preview.input && `Вход: ${preview.input}`,
       preview.output && `Выход: ${preview.output}`,
+      preview.baseProject && `Базовый проект EDT: ${preview.baseProject}`,
+      preview.cfu && `CFU: ${preview.cfu.current.name} · ${preview.cfu.current.vendor} · ${preview.cfu.current.version} → ${preview.cfu.target.version}`,
+      preview.cfu && `Допустимые исходные версии: ${preview.cfu.allowedVersions.join(", ")}`,
+      preview.cfu && `Проверенный SHA-256: ${preview.cfu.sha256}`,
+      preview.sourceSha256 && `Проверенный SHA-256 копии DT: ${preview.sourceSha256}`,
       preview.extension && `Расширение: ${preview.extension}`,
       preview.config && `Настройки тестов: ${preview.config}`,
       preview.targetState,
@@ -608,7 +626,7 @@ export default async function plugin(bb: BbPluginApi) {
       return host.call("platformSaveProfile", { path: source, profile }, { hostId });
     },
     async platformPreview({ request, ...scope }, { experimental_signal: signal }) {
-      return (await preparePlatform(scope, request, signal)).preview;
+      return previewPlatform(scope, request, signal);
     },
     async platformStart({ request, confirmation, inspected, ...scope }, { experimental_signal: signal }) {
       return startPlatform(scope, request, confirmation, inspected, signal);
@@ -616,6 +634,19 @@ export default async function plugin(bb: BbPluginApi) {
     async platformJournal(scope) {
       const { hostScope, hostId } = await operationTarget(scope);
       return host.call("platformJournal", hostScope, { hostId });
+    },
+    async platformInventory(scope, { experimental_signal: signal }) {
+      const { hostScope, hostId } = await operationTarget(scope);
+      return { ...await host.call("platformInventory", hostScope, { hostId, signal }), hostId };
+    },
+    async platformTools(scope, { experimental_signal: signal }) {
+      const { hostScope, hostId, source } = await operationTarget(scope);
+      const fallback = (await readCommon()).platformPath;
+      return { ...await host.call("platformTools", { ...hostScope, source, fallback }, { hostId, signal }), hostId };
+    },
+    async platformCluster({ query, ...scope }, { experimental_signal: signal }) {
+      const { hostScope, hostId, source } = await operationTarget(scope);
+      return host.call("platformCluster", { ...hostScope, source, fallback: (await readCommon()).platformPath, query }, { hostId, signal });
     },
     async platformStatus({ id, ...scope }) {
       const { hostScope, hostId } = await operationTarget(scope);
@@ -1164,7 +1195,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   const VALUE_OPTIONS = new Set([
     "thread", "environment", "profile", "input", "output", "extension", "config", "confirm", "inspected", "artifact",
-    "finished-at", "revision",
+    "finished-at", "revision", "base-project", "ras", "cluster", "sha256",
     "dir",
     "format",
     "timeout",
@@ -1235,9 +1266,11 @@ export default async function plugin(bb: BbPluginApi) {
       return respond(Object.keys(platformActions), [
         "bb 1c-properties platform preview|run <операция> [проект]",
         "  [--thread ID | --environment ID] [--profile ИМЯ] [--input ПУТЬ] [--output ПУТЬ]",
-        "  [--extension ИМЯ] [--config JSON] [--format Hierarchical|Plain] [--json]",
+        "  [--extension ИМЯ] [--config JSON] [--format Hierarchical|Plain] [--base-project КАТАЛОГ_EDT] [--sha256 SHA256_CFU_ИЛИ_DT] [--json]",
         "  run: [--confirm КОД] [--inspected ID] [--no-wait]",
         "bb 1c-properties platform profiles|journal [проект] [--json]",
+        "bb 1c-properties platform tools [проект] [--thread ID | --environment ID] [--json]",
+        "bb 1c-properties platform clusters|sessions [проект] --ras ХОСТ[:ПОРТ] [--cluster UUID] [--json]",
         "bb 1c-properties platform save-profile [проект] --args-file <JSON>",
         "bb 1c-properties platform show|cancel|artifact <ID> [проект] [--artifact ИМЯ]",
         "bb 1c-properties platform import-diagnostics bsl-ls|apk [проект]",
@@ -1256,6 +1289,18 @@ export default async function plugin(bb: BbPluginApi) {
     switch (verb) {
       case "profiles":
         return respond(await host.call("platformProfiles", { ...hostScope, source }, options));
+      case "tools": {
+        const tools = await host.call("platformTools", { ...hostScope, source, fallback: (await readCommon()).platformPath }, options);
+        return respond({ hostId, ...tools });
+      }
+      case "clusters":
+      case "sessions": {
+        const cluster = values.get("cluster");
+        if (verb === "sessions" && !cluster) throw new Error("Для списка сеансов укажи --cluster UUID.");
+        if (verb === "clusters" && cluster) throw new Error("Для чтения сеансов используй platform sessions.");
+        const query = platformClusterRequestSchema.parse({ endpoint: values.get("ras"), cluster });
+        return respond(await host.call("platformCluster", { ...hostScope, source, fallback: (await readCommon()).platformPath, query }, options));
+      }
       case "save-profile": {
         const parsed = readJsonArgs(values);
         if (parsed.error) throw new Error(parsed.error);
@@ -1289,9 +1334,10 @@ export default async function plugin(bb: BbPluginApi) {
         const request = platformRequestSchema.parse({
           action: first, profile: values.get("profile"), input: values.get("input"), output: values.get("output"),
           extension: values.get("extension"), config: values.get("config"), format: values.get("format"),
+          baseProject: values.get("base-project"), sha256: values.get("sha256"),
         });
         if (verb === "preview") {
-          const { preview } = await preparePlatform(scope, request, context.signal);
+          const preview = await previewPlatform(scope, request, context.signal);
           return respond(preview, formatPreview(preview));
         }
         const confirmation = platformRunOptions.confirmation.parse(values.get("confirm"));

@@ -1,0 +1,110 @@
+.platform-workbench {
+  container: platform-workbench / inline-size;
+  min-width: 0;
+}
+
+.platform-layout {
+  display: grid;
+  gap: .75rem;
+  min-width: 0;
+}
+
+.platform-fields {
+  display: grid;
+  gap: .5rem;
+}
+
+.platform-tree {
+  min-width: 0;
+  max-height: min(55vh, 34rem);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: .5rem;
+  padding: .25rem;
+}
+
+.platform-search {
+  display: flex;
+  gap: .25rem;
+  padding: .3rem;
+  align-items: center;
+}
+
+.platform-row {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  min-height: 1.75rem;
+  min-width: 0;
+  border-radius: .25rem;
+  padding: .2rem .35rem;
+  cursor: pointer;
+  text-align: left;
+  font-size: .8125rem;
+  line-height: 1.2;
+}
+
+.platform-leaf {
+  width: 100%;
+  flex: 1;
+}
+
+.platform-leaf:disabled {
+  cursor: default;
+  opacity: .55;
+}
+
+.platform-row:hover, .platform-star:hover {
+  background: var(--state-hover, var(--accent));
+}
+
+.platform-row[aria-current="true"] {
+  background: var(--state-active, var(--accent));
+  font-weight: 600;
+}
+
+.platform-row:focus-visible, .platform-star:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+.platform-branch > summary { list-style: none; }
+.platform-branch > summary::-webkit-details-marker { display: none; }
+.platform-branch[open] > summary > .platform-chevron { transform: rotate(90deg); }
+
+.platform-children {
+  margin-left: .82rem;
+  padding-left: .28rem;
+  border-left: 1px solid var(--border);
+}
+
+.platform-command {
+  display: flex;
+  align-items: center;
+}
+
+.platform-star {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: .25rem;
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+
+.platform-star[aria-pressed="true"] {
+  color: var(--foreground);
+  background: var(--state-active, var(--accent));
+}
+
+@container platform-workbench (min-width: 43rem) {
+  .platform-layout {
+    grid-template-columns: minmax(15rem, 21rem) minmax(0, 1fr);
+    align-items: start;
+  }
+  .platform-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .platform-fields > h4 { grid-column: 1 / -1; }
+  .platform-tree { max-height: min(72vh, 47rem); }
+}

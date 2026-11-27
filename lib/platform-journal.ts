@@ -47,6 +47,11 @@ export function redactLog(text: string, secrets: string[]): string {
   return clean;
 }
 
+export function decodePlatformConsole(buffer: Buffer): string {
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(buffer); }
+  catch { return new TextDecoder("ibm866").decode(buffer); }
+}
+
 export function readJUnit(text: string): NonNullable<PlatformJournalEntry["counts"]> {
   if (/<!DOCTYPE|<!ENTITY/i.test(text) || XMLValidator.validate(text) !== true) throw new Error("Некорректный отчёт JUnit.");
   const xml = new XMLParser({ ignoreAttributes: false, processEntities: false, parseTagValue: false }).parse(text);

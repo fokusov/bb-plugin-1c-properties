@@ -185,6 +185,15 @@ export function pickPowerShell(platformExe: string): { exe: string; bitness: num
   return { exe: "powershell.exe", bitness: 64 };
 }
 
+export function designerSpawnArguments(exe: string, args: string[]) {
+  // CREATEINFOBASE parses File="…" from the Windows command line, not from the standard argv decoder.
+  if (process.platform !== "win32" || args[0] !== "CREATEINFOBASE") return { args, options: {} };
+  return {
+    args: args.map((arg, index) => index !== 1 && /\s/.test(arg) ? `"${arg}"` : arg),
+    options: { windowsVerbatimArguments: true, argv0: `"${exe}"` },
+  };
+}
+
 /** Platform words instead of an HRESULT: the user needs a reason, not a code. */
 export function comErrorText(message: string): string {
   const text = String(message || "").trim();
