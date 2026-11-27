@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { experimental_ProviderModelPicker as ProviderModelPicker, useBbNavigate, useRpc, useSdk } from "@get-bb/plugin-sdk/app";
 import type { ExperimentalProviderModelPickerValue, ExperimentalThreadTabProps } from "@get-bb/plugin-sdk/app";
 import type { z } from "zod";
-import { reviewContract, reviewTarget } from "../review-contract.js";
+import { reviewContract, reviewTarget, strictReviewUnavailable } from "../review-contract.js";
 
 type ReviewList = z.infer<typeof reviewContract.reviewList.output>;
 const EVIDENCE_LABELS = {
@@ -27,6 +27,7 @@ function ReviewForm({ threadId, environmentId }: { threadId: string; environment
   const [taskId, setTaskId] = useState("");
   const [brief, setBrief] = useState("");
   const [accepted, setAccepted] = useState(false);
+  const [requireReadOnly, setRequireReadOnly] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [statusError, setStatusError] = useState("");
@@ -78,7 +79,7 @@ function ReviewForm({ threadId, environmentId }: { threadId: string; environment
     : { kind: "openspec", change: change.trim(), head });
 
   async function start() {
-    if (!target.success || !execution || !accepted) return;
+    if (!target.success || !execution || !accepted || requireReadOnly) return;
     setBusy(true);
     setError("");
     try {
@@ -126,8 +127,11 @@ function ReviewForm({ threadId, environmentId }: { threadId: string; environment
       <label className="grid gap-1">Вопрос и фокус ревью<textarea className="rounded border bg-transparent p-1" value={brief} maxLength={4000} onChange={(event) => setBrief(event.target.value)} required /></label>
       {execution && <div className="flex flex-wrap items-center gap-2"><span>Модель рецензента</span><ProviderModelPicker value={execution} onChange={setExecution} routing={{ kind: "environment", environmentId }} /></div>}
       <p>BB создаст отдельный worktree из выбранной ревизии. Запуск использует <code>accept-edits</code>, который разрешает запись в эту копию. Незакоммиченные материалы в ревью не попадут.</p>
-      <label className="flex items-start gap-2"><input type="checkbox" checked={accepted} onChange={(event) => setAccepted(event.target.checked)} />Использовать отдельную рабочую копию</label>
-      <button type="submit" className="w-fit rounded border px-3 py-1 disabled:opacity-50" disabled={busy || !accepted || !target.success || !execution || !taskId.trim() || !brief.trim()}>{busy ? "Запуск…" : "Запустить ревью"}</button>
+      <label className="flex items-start gap-2"><input type="checkbox" checked={requireReadOnly} onChange={(event) => { setRequireReadOnly(event.target.checked); setAccepted(false); }} />Требовать технический запрет записи</label>
+      {requireReadOnly ? <p role="alert">{strictReviewUnavailable}</p> : (
+        <label className="flex items-start gap-2"><input type="checkbox" checked={accepted} onChange={(event) => setAccepted(event.target.checked)} />Использовать отдельную рабочую копию</label>
+      )}
+      <button type="submit" className="w-fit rounded border px-3 py-1 disabled:opacity-50" disabled={busy || requireReadOnly || !accepted || !target.success || !execution || !taskId.trim() || !brief.trim()}>{busy ? "Запуск…" : "Запустить ревью"}</button>
     </form>
     {error && <p role="alert">{error}</p>}
     <section className="grid gap-2">

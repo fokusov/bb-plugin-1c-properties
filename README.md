@@ -70,12 +70,12 @@ lease-ом, пока идёт дочерний процесс; при выгру
 ## Установка
 
 ```powershell
-bb plugin install git:https://github.com/fokusov/bb-plugin-1c-properties.git@v0.1.3
+bb plugin install git:https://github.com/fokusov/bb-plugin-1c-properties.git@v0.1.4
 ```
 
 Для разработки из локальной копии выполните `npm ci` и `bb plugin install .`. После правок выполните `bb plugin build .` и `bb plugin reload 1c-properties`.
 
-Проверенная версия BB на Windows — `0.50.1`, Plugin SDK — `0.6.157`. Второе мнение использует отдельный worktree с `accept-edits`. Режим принудительного запрета записи для агента и отдельное окружение BB для каждого исполнителя штатного Workflow требуют отдельной проверки.
+Проверенная версия BB на Windows — `0.50.1`, Plugin SDK — `0.6.157`. Второе мнение использует отдельный worktree с `accept-edits`. При требовании технического запрета записи кнопка и RPC блокируют запуск. Для пишущих исполнителей с отдельными окружениями используйте [видимые дочерние треды BB](docs/workflows-manual-run.md#исполнители-в-отдельных-окружениях-bb).
 
 ## CLI
 

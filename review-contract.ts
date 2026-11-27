@@ -10,6 +10,7 @@ export const reviewTarget = z.discriminatedUnion("kind", [
 ]);
 
 export const reviewSource = z.object({ threadId: identifier, environmentId: identifier }).strict();
+export const strictReviewUnavailable = "Эта версия плагина не поддерживает принудительный запрет записи для рецензента в BB. Запуск заблокирован.";
 export const reviewRecord = z.object({
   role: z.literal("reviewer"),
   taskId: identifier,
@@ -39,6 +40,7 @@ export const reviewContract = defineRpcContract({
       serviceTier: identifier.optional(),
       brief: z.string().trim().min(1).max(4_000),
       isolatedWorktree: z.literal(true),
+      requireReadOnly: z.boolean().optional(),
     }).strict(),
     output: z.object({ threadId: identifier }),
   },

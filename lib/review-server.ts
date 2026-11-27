@@ -1,6 +1,6 @@
 import type { BbPluginApi, PluginRpcHandlers } from "@get-bb/plugin-sdk";
 import type { z } from "zod";
-import { reviewContract, reviewRecord } from "../review-contract.js";
+import { reviewContract, reviewRecord, strictReviewUnavailable } from "../review-contract.js";
 
 interface ReviewHost {
   head(path: string, hostId: string): Promise<string>;
@@ -30,7 +30,8 @@ export function registerReview(bb: BbPluginApi, host: ReviewHost): void {
       const { path, environment } = await source(scope);
       return host.evidence(path, environment.hostId, change);
     },
-    async reviewStart({ taskId, target, providerId, model, reasoningLevel, serviceTier, brief, threadId, environmentId }) {
+    async reviewStart({ taskId, target, providerId, model, reasoningLevel, serviceTier, brief, threadId, environmentId, requireReadOnly }) {
+      if (requireReadOnly) throw new Error(strictReviewUnavailable);
       const { parent, environment, path } = await source({ threadId, environmentId });
       const [files, catalog] = await Promise.all([
         host.files(path, environment.hostId, target),
